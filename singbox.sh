@@ -117,7 +117,7 @@ _detect_init_system() {
 _install_dependencies() {
     _info "正在检查并安装所需依赖..."
     local pkgs_to_install=""
-    local required_pkgs="curl jq openssl wget procps"
+    local required_pkgs="curl jq openssl wget procps iptables"
     local pm=""
 
     if command -v apk &>/dev/null; then
@@ -165,6 +165,76 @@ _install_dependencies() {
         chmod +x ${YQ_BINARY}
     fi
     _success "所有依赖均已满足。"
+}
+
+# 智能保存 iptables 规则（支持 Debian 和 Alpine）
+_save_iptables_rules() {
+    _info "正在保存 iptables 规则..."
+    
+    if [ "$INIT_SYSTEM" == "openrc" ]; then
+        # Alpine Linux: 使用 iptables 服务
+        local rules_file="/etc/iptables/rules-save"
+        mkdir -p /etc/iptables 2>/dev/null
+        iptables-save > "$rules_file" 2>/dev/null
+        
+        # 启用 iptables 服务自动启动
+        if command -v rc-update &>/dev/null; then
+            rc-update add iptables default 2>/dev/null
+            _success "iptables 规则已保存，重启后自动恢复"
+        else
+            _warning "请手动配置 iptables 开机自启"
+        fi
+    else
+        # Debian/Ubuntu: 使用 iptables-persistent 或直接保存
+        local rules_file="/etc/iptables/rules.v4"
+        mkdir -p /etc/iptables 2>/dev/null
+        iptables-save > "$rules_file" 2>/dev/null
+        
+        # 检查是否安装了 iptables-persistent
+        if dpkg -l | grep -q iptables-persistent 2>/dev/null; then
+            _success "iptables 规则已保存，重启后自动恢复"
+        else
+            # 尝试安装 iptables-persistent（静默安装）
+            if command -v apt-get &>/dev/null; then
+                DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent >/dev/null 2>&1
+                if [ $? -eq 0 ]; then
+                    _success "iptables-persistent 已安装，规则将在重启后自动恢复"
+                else
+                    _warning "规则已保存到 ${rules_file}，但需手动加载"
+                    _info "开机加载命令: iptables-restore < ${rules_file}"
+                fi
+            else
+                _warning "规则已保存到 ${rules_file}，但需手动加载"
+                _info "开机加载命令: iptables-restore < ${rules_file}"
+            fi
+        fi
+    fi
+}
+
+# 确保 iptables 已安装
+_ensure_iptables() {
+    if ! command -v iptables &>/dev/null; then
+        _info "未检测到 iptables，尝试安装..."
+        if command -v apk &>/dev/null; then
+            apk add --no-cache iptables
+        elif command -v apt-get &>/dev/null; then
+            apt-get update && apt-get install -y iptables
+        elif command -v yum &>/dev/null; then
+            yum install -y iptables
+        elif command -v dnf &>/dev/null; then
+            dnf install -y iptables
+        else
+            _error "无法自动安装 iptables，请手动安装后重试。"
+            return 1
+        fi
+        
+        if ! command -v iptables &>/dev/null; then
+             _error "iptables 安装失败。"
+             return 1
+        fi
+        _success "iptables 安装成功。"
+    fi
+    return 0
 }
 
 _install_sing_box() {
@@ -783,23 +853,34 @@ _uninstall_argo() {
 _argo_menu() {
     while true; do
         clear
-        echo "=========================================="
-        _info "        Argo 隧道节点管理"
-        echo "=========================================="
-        echo " 1) 创建 VLESS-WS + Argo 节点"
-        echo " 2) 创建 Trojan-WS + Argo 节点"
-        echo "------------------------------------------"
-        echo " 3) 查看 Argo 节点信息"
-        echo " 4) 删除 Argo 节点"
-        echo "------------------------------------------"
-        echo " 5) 重启隧道 (获取新域名)"
-        echo " 6) 停止隧道"
-        echo "------------------------------------------"
-        echo -e " 7) ${RED}卸载 Argo 服务${NC}"
-        echo "------------------------------------------"
-        echo " 0) 返回主菜单"
-        echo "=========================================="
-        read -p "请输入选项 [0-7]: " choice
+        echo -e "${CYAN}"
+        echo '  ╔═══════════════════════════════════════╗'
+        echo '  ║           Argo 隧道节点管理           ║'
+        echo '  ╚═══════════════════════════════════════╝'
+        echo -e "${NC}"
+        echo ""
+        
+        echo -e "  ${CYAN}【创建节点】${NC}"
+        echo -e "    ${GREEN}[1]${NC} 创建 VLESS-WS + Argo 节点"
+        echo -e "    ${GREEN}[2]${NC} 创建 Trojan-WS + Argo 节点"
+        echo ""
+        
+        echo -e "  ${CYAN}【节点管理】${NC}"
+        echo -e "    ${GREEN}[3]${NC} 查看 Argo 节点信息"
+        echo -e "    ${GREEN}[4]${NC} 删除 Argo 节点"
+        echo ""
+        
+        echo -e "  ${CYAN}【隧道控制】${NC}"
+        echo -e "    ${GREEN}[5]${NC} 重启隧道 (获取新域名)"
+        echo -e "    ${GREEN}[6]${NC} 停止隧道"
+        echo -e "    ${RED}[7]${NC} 卸载 Argo 服务"
+        echo ""
+        
+        echo -e "  ─────────────────────────────────────────"
+        echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
+        echo ""
+        
+        read -p "  请输入选项 [0-7]: " choice
         
         case $choice in
             1) _add_argo_vless_ws ;;
@@ -827,7 +908,7 @@ Description=sing-box service
 Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target
 [Service]
-ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE} -c /etc/singbox/relay.json
+ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json
 Restart=on-failure
 RestartSec=10s
 LimitNOFILE=infinity
@@ -845,7 +926,7 @@ _create_openrc_service() {
 
 description="sing-box service"
 command="${SINGBOX_BIN}"
-command_args="run -c ${CONFIG_FILE} -c /etc/singbox/relay.json"
+command_args="run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json"
 command_background=true
 pidfile="${PID_FILE}"
 start_stop_daemon_args="--stdout ${LOG_FILE} --stderr ${LOG_FILE}"
@@ -860,6 +941,12 @@ EOF
 
 _create_service_files() {
     if [ -f "$SERVICE_FILE" ]; then return; fi
+    
+    # 确保 relay.json 存在（空配置），否则 sing-box 会因找不到文件而启动失败
+    local RELAY_JSON="${SINGBOX_DIR}/relay.json"
+    if [ ! -f "$RELAY_JSON" ]; then
+        echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_JSON"
+    fi
     
     _info "正在创建 ${INIT_SYSTEM} 服务文件..."
     if [ "$INIT_SYSTEM" == "systemd" ]; then
@@ -1269,17 +1356,27 @@ _atomic_modify_yaml() {
     fi
 }
 
+# 安全地从 clash.yaml 获取代理字段值（支持中文和特殊字符的节点名称）
+_get_proxy_field() {
+    local proxy_name="$1"
+    local field="$2"
+    # 使用 yq 的环境变量功能避免特殊字符问题
+    PROXY_NAME="$proxy_name" ${YQ_BINARY} eval '.proxies[] | select(.name == env(PROXY_NAME)) | '"$field" "${CLASH_YAML_FILE}" 2>/dev/null | head -n 1
+}
+
 _add_node_to_yaml() {
     local proxy_json="$1"
     local proxy_name=$(echo "$proxy_json" | jq -r .name)
     _atomic_modify_yaml "$CLASH_YAML_FILE" ".proxies |= . + [${proxy_json}] | .proxies |= unique_by(.name)"
-    _atomic_modify_yaml "$CLASH_YAML_FILE" '.proxy-groups[] |= (select(.name == "节点选择") | .proxies |= . + ["'${proxy_name}'"] | .proxies |= unique)'
+    # 使用环境变量避免特殊字符问题
+    PROXY_NAME="$proxy_name" ${YQ_BINARY} eval '.proxy-groups[] |= (select(.name == "节点选择") | .proxies |= . + [env(PROXY_NAME)] | .proxies |= unique)' -i "$CLASH_YAML_FILE"
 }
 
 _remove_node_from_yaml() {
     local proxy_name="$1"
-    _atomic_modify_yaml "$CLASH_YAML_FILE" 'del(.proxies[] | select(.name == "'${proxy_name}'"))'
-    _atomic_modify_yaml "$CLASH_YAML_FILE" '.proxy-groups[] |= (select(.name == "节点选择") | .proxies |= del(.[] | select(. == "'${proxy_name}'")))'
+    # 使用环境变量避免特殊字符问题
+    PROXY_NAME="$proxy_name" ${YQ_BINARY} eval 'del(.proxies[] | select(.name == env(PROXY_NAME)))' -i "$CLASH_YAML_FILE"
+    PROXY_NAME="$proxy_name" ${YQ_BINARY} eval '.proxy-groups[] |= (select(.name == "节点选择") | .proxies |= del(.[] | select(. == env(PROXY_NAME))))' -i "$CLASH_YAML_FILE"
 }
 
 _add_vless_ws_tls() {
@@ -1878,6 +1975,57 @@ _add_hysteria2() {
         _info "已启用 Salamander 混淆。"
     fi
     
+    # [!] 新增：端口跳跃功能
+    local port_hopping=""
+    local port_range_start=""
+    local port_range_end=""
+    read -p "是否开启端口跳跃? (y/N): " hop_choice
+    if [[ "$hop_choice" == "y" || "$hop_choice" == "Y" ]]; then
+        read -p "请输入端口范围 (格式: 起始端口-结束端口, 例如 20000-30000): " port_range
+        if [[ "$port_range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            port_range_start="${BASH_REMATCH[1]}"
+            port_range_end="${BASH_REMATCH[2]}"
+            if [ "$port_range_start" -lt "$port_range_end" ] && [ "$port_range_start" -ge 1024 ] && [ "$port_range_end" -le 65535 ]; then
+                port_hopping="$port_range"
+                _info "端口跳跃范围: ${port_range_start}-${port_range_end}"
+                
+                # 计算端口数量
+                local hop_count=$((port_range_end - port_range_start + 1))
+                local use_multiport="false"
+
+                if [ "$hop_count" -le 50 ]; then
+                    _info "端口范围较小 (${hop_count} 个)，将使用 多端口监听模式 (兼容 LXC 和 NAT VPS)..."
+                    use_multiport="true"
+                else
+                    _info "端口范围较大，将尝试使用 iptables 转发模式..."
+                    # 检查 iptables
+                    if ! _ensure_iptables; then
+                        _warning "iptables 不可用，且端口范围过大，端口跳跃配置跳过。"
+                        port_hopping=""
+                    else
+                        # 配置 iptables 规则
+                        _info "正在配置端口跳跃 iptables 规则..."
+                        iptables -t nat -A PREROUTING -p udp --dport ${port_range_start}:${port_range_end} -j DNAT --to-destination 127.0.0.1:${port}
+                        if [ $? -eq 0 ]; then
+                            _success "iptables 规则已添加"
+                            # 保存规则（智能检测系统类型）
+                            _save_iptables_rules
+                        else
+                            _warning "iptables 规则添加失败，请手动配置或检查 iptables 是否可用"
+                            _warning "可能原因：系统未加载 ip_tables/iptable_nat 模块，或 LXC 容器无权限"
+                        fi
+                    fi
+                fi
+            else
+                _error "端口范围无效，端口跳跃未启用"
+                port_hopping=""
+            fi
+        else
+            _error "端口范围格式错误，端口跳跃未启用"
+            port_hopping=""
+        fi
+    fi
+    
     # [!] 新增：自定义名称
     local default_name="Hysteria2-${port}"
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
@@ -1889,16 +2037,84 @@ _add_hysteria2() {
     local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$password" --arg op "$obfs_password" --arg cert "$cert_path" --arg key "$key_path" \
         '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}} | if $op != "" then .obfs={"type":"salamander","password":$op} else . end')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]" || return 1
+
+    # [!] 新增：多端口监听模式逻辑
+    if [ "$use_multiport" == "true" ] && [ -n "$port_hopping" ]; then
+        _info "正在生成多端口监听配置 (${port_range_start}-${port_range_end})..."
+        
+        # 使用 Bash 循环构建 JSON 数组，避免复杂 jq 语法问题
+        local multi_json_array="["
+        local first=true
+        
+        for ((p=port_range_start; p<=port_range_end; p++)); do
+            # 跳过主端口
+            if [ "$p" -eq "$port" ]; then continue; fi
+            
+            if [ "$first" = true ]; then first=false; else multi_json_array+=","; fi
+            
+            local hop_tag="${tag}-hop-${p}"
+            # 生成单个端口的配置
+            local item_json=$(jq -n --arg t "$hop_tag" --arg p "$p" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" \
+                '{
+                    "type": "hysteria2",
+                    "tag": $t,
+                    "listen": "::",
+                    "listen_port": ($p|tonumber),
+                    "users": [{"password": $pw}],
+                    "tls": {
+                        "enabled": true,
+                        "alpn": ["h3"],
+                        "certificate_path": $cert,
+                        "key_path": $key
+                    }
+                }')
+                
+            # 如果有混淆，追加混淆配置
+            if [ -n "$obfs_password" ]; then
+                item_json=$(echo "$item_json" | jq --arg op "$obfs_password" '.obfs={"type":"salamander","password":$op}')
+            fi
+            
+            multi_json_array+="$item_json"
+        done
+        multi_json_array+="]"
+        
+        # 追加到配置文件
+        _atomic_modify_json "$CONFIG_FILE" ".inbounds += $multi_json_array" || return 1
+        _success "已添加 $((port_range_end - port_range_start)) 个辅助监听端口"
+    fi
     
-    local meta_json=$(jq -n --arg up "$up_speed" --arg down "$down_speed" --arg op "$obfs_password" \
-        '{ "up": $up, "down": $down } | if $op != "" then .obfsPassword = $op else . end')
+    # 保存元数据（包含端口跳跃信息）
+    local meta_json=$(jq -n --arg up "$up_speed" --arg down "$down_speed" --arg op "$obfs_password" --arg hop "$port_hopping" \
+        '{ "up": $up, "down": $down } | if $op != "" then .obfsPassword = $op else . end | if $hop != "" then .portHopping = $hop else . end')
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
 
-    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg pw "$password" --arg sn "$server_name" --arg up "$up_speed" --arg down "$down_speed" --arg op "$obfs_password" \
-        '{"name":$n,"type":"hysteria2","server":$s,"port":($p|tonumber),"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"up":$up,"down":$down} | if $op != "" then .obfs="salamander" | .["obfs-password"]=$op else . end')
+    # Clash 配置中的端口（如果有端口跳跃，使用范围格式）
+    local clash_ports="$port"
+    if [ -n "$port_hopping" ]; then
+        clash_ports="$port_hopping"
+    fi
+    
+    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg ports "$clash_ports" --arg pw "$password" --arg sn "$server_name" --arg up "$up_speed" --arg down "$down_speed" --arg op "$obfs_password" --arg hop "$port_hopping" \
+        '{
+            "name": $n,
+            "type": "hysteria2",
+            "server": $s,
+            "port": ($p|tonumber),
+            "password": $pw,
+            "sni": $sn,
+            "skip-cert-verify": true,
+            "alpn": ["h3"],
+            "up": $up,
+            "down": $down
+        } | if $op != "" then .obfs = "salamander" | .["obfs-password"] = $op else . end | if $hop != "" then .ports = $hop else . end')
     _add_node_to_yaml "$proxy_json"
     
     _success "Hysteria2 节点 [${name}] 添加成功!"
+    
+    # 显示端口跳跃信息
+    if [ -n "$port_hopping" ]; then
+        _info "端口跳跃范围: ${port_hopping}"
+    fi
 }
 
 _add_tuic() {
@@ -2011,9 +2227,14 @@ _add_socks() {
 _view_nodes() {
     if ! jq -e '.inbounds | length > 0' "$CONFIG_FILE" >/dev/null 2>&1; then _warning "当前没有任何节点。"; return; fi
     
-    _info "--- 当前节点信息 (共 $(jq '.inbounds | length' "$CONFIG_FILE") 个) ---"
+    # 统计有效节点数量（排除辅助节点）
+    local node_count=$(jq '[.inbounds[] | select(.tag | contains("-hop-") | not)] | length' "$CONFIG_FILE")
+    _info "--- 当前节点信息 (共 ${node_count} 个) ---"
     jq -c '.inbounds[]' "$CONFIG_FILE" | while read -r node; do
         local tag=$(echo "$node" | jq -r '.tag') type=$(echo "$node" | jq -r '.type') port=$(echo "$node" | jq -r '.listen_port')
+        
+        # 过滤掉多端口监听生成的辅助节点（跳过 tag 中包含 -hop- 的节点）
+        if [[ "$tag" == *"-hop-"* ]]; then continue; fi
         
         # 优化查找逻辑：优先使用端口匹配，因为tag和name可能不完全对应
         local proxy_name_to_find=""
@@ -2037,7 +2258,7 @@ _view_nodes() {
         local display_name=${proxy_name_to_find:-$tag}
 
         # 优先使用 metadata.json 中的 IP (用于 REALITY 和 TCP)
-        local display_server=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .server' ${CLASH_YAML_FILE} | head -n 1)
+        local display_server=$(_get_proxy_field "$proxy_name_to_find" ".server")
         # 移除方括号
         local display_ip=$(echo "$display_server" | tr -d '[]')
         # IPv6链接格式：添加[]
@@ -2050,136 +2271,86 @@ _view_nodes() {
         case "$type" in
             "vless")
                 local uuid=$(echo "$node" | jq -r '.users[0].uuid')
-                local transport_type=$(echo "$node" | jq -r '.transport.type')
-                local listen_addr=$(echo "$node" | jq -r '.listen')
-
-                if [ "$transport_type" == "ws" ]; then
-                    # 检测是否为 Argo 节点 (监听 127.0.0.1)
-                    if [ "$listen_addr" == "127.0.0.1" ]; then
-                        # Argo 节点：使用当前隧道域名
-                        local ws_path=$(echo "$node" | jq -r '.transport.path')
-                        local encoded_path=$(_url_encode "$ws_path")
-                        
-                        # 获取当前隧道域名
-                        local argo_domain=""
-                        if [ -f "$ARGO_LOG_FILE" ]; then
-                            argo_domain=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' "$ARGO_LOG_FILE" 2>/dev/null | tail -1 | sed 's|https://||')
+                local flow=$(echo "$node" | jq -r '.users[0].flow // empty')
+                local is_reality=$(echo "$node" | jq -r '.tls.reality.enabled // false')
+                local transport_type=$(echo "$node" | jq -r '.transport.type // empty')
+                
+                if [ "$is_reality" == "true" ]; then
+                    local meta=$(jq -r --arg t "$tag" '.[$t]' "$METADATA_FILE")
+                    local sn=$(echo "$node" | jq -r '.tls.server_name // "www.microsoft.com"')
+                    local pk=$(echo "$meta" | jq -r '.publicKey')
+                    local sid=$(echo "$meta" | jq -r '.shortId')
+                    local fp="chrome"
+                    url="vless://${uuid}@${link_ip}:${port}?security=reality&encryption=none&pbk=${pk}&fp=${fp}&type=tcp&flow=${flow}&sni=${sn}&sid=${sid}#$(_url_encode "$display_name")"
+                elif [ "$transport_type" == "ws" ]; then
+                    local ws_path=$(echo "$node" | jq -r '.transport.path')
+                    local sn=$(_get_proxy_field "$proxy_name_to_find" ".servername")
+                    url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=ws&host=${sn}&path=$(_url_encode "$ws_path")&sni=${sn}#$(_url_encode "$display_name")"
+                    
+                    # [!] 处理 Argo 节点
+                    local is_argo=$(jq -r --arg t "$tag" '.[$t].isArgo // false' "$METADATA_FILE")
+                    if [ "$is_argo" == "true" ]; then
+                        local argo_domain=$(jq -r --arg t "$tag" '.[$t].argoDomain' "$METADATA_FILE")
+                        if [ -n "$argo_domain" ] && [ "$argo_domain" != "null" ]; then
+                            url="vless://${uuid}@${argo_domain}:443?security=tls&encryption=none&type=ws&host=${argo_domain}&path=$(_url_encode "$ws_path")&sni=${argo_domain}#$(_url_encode "$display_name")"
                         fi
-                        
-                        if [ -n "$argo_domain" ]; then
-                            url="vless://${uuid}@${argo_domain}:443?encryption=none&security=tls&type=ws&host=${argo_domain}&path=${encoded_path}&sni=${argo_domain}#$(_url_encode "$display_name")"
-                        else
-                            # 隧道未运行，从元数据获取保存的域名
-                            local saved_domain=$(jq -r ".\"$tag\".domain // empty" "$ARGO_METADATA_FILE" 2>/dev/null)
-                            if [ -n "$saved_domain" ]; then
-                                url="vless://${uuid}@${saved_domain}:443?encryption=none&security=tls&type=ws&host=${saved_domain}&path=${encoded_path}&sni=${saved_domain}#$(_url_encode "$display_name")"
-                                _warning "  [隧道未运行] 使用保存的域名"
-                            else
-                                _warning "  [Argo 节点] 隧道未运行，无法生成链接"
-                            fi
-                        fi
-                    else
-                        # 普通 VLESS + WS + TLS
-                        local server_addr=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .server' ${CLASH_YAML_FILE} | head -n 1)
-                        local host_header=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .ws-opts.headers.Host' ${CLASH_YAML_FILE} | head -n 1)
-                        local client_port=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .port' ${CLASH_YAML_FILE} | head -n 1)
-                        local sni=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .servername' ${CLASH_YAML_FILE} | head -n 1)
-                        local ws_path=$(echo "$node" | jq -r '.transport.path')
-                        local encoded_path=$(_url_encode "$ws_path")
-                        url="vless://${uuid}@${server_addr}:${client_port}?encryption=none&security=tls&type=ws&host=${host_header}&path=${encoded_path}&sni=${sni}#$(_url_encode "$display_name")"
                     fi
-                elif [ "$(echo "$node" | jq -r '.tls.reality.enabled')" == "true" ]; then
-                    # VLESS + REALITY
-                    local sn=$(echo "$node" | jq -r '.tls.server_name'); local flow=$(echo "$node" | jq -r '.users[0].flow')
-                    local meta=$(jq -r --arg t "$tag" '.[$t]' "$METADATA_FILE"); local pk=$(echo "$meta" | jq -r '.publicKey'); local sid=$(echo "$meta" | jq -r '.shortId')
-                    # [!] 已修改：使用 display_name
-                    url="vless://${uuid}@${link_ip}:${port}?encryption=none&security=reality&type=tcp&sni=${sn}&fp=chrome&flow=${flow}&pbk=${pk}&sid=${sid}#$(_url_encode "$display_name")"
                 else
-                    # VLESS + TCP
-                    # [!] 已修改：使用 display_name
-                    url="vless://${uuid}@${link_ip}:${port}?type=tcp&security=none#$(_url_encode "$display_name")"
+                    local sn=$(echo "$node" | jq -r '.tls.server_name // "www.microsoft.com"')
+                    url="vless://${uuid}@${link_ip}:${port}?security=tls&encryption=none&type=tcp&sni=${sn}#$(_url_encode "$display_name")"
                 fi
                 ;;
-            
-            # [!!!] 新增 TROJAN 支持
             "trojan")
                 local password=$(echo "$node" | jq -r '.users[0].password')
-                local transport_type=$(echo "$node" | jq -r '.transport.type')
-                local listen_addr=$(echo "$node" | jq -r '.listen')
-
+                local transport_type=$(echo "$node" | jq -r '.transport.type // empty')
+                
                 if [ "$transport_type" == "ws" ]; then
-                    # 检测是否为 Argo 节点 (监听 127.0.0.1)
-                    if [ "$listen_addr" == "127.0.0.1" ]; then
-                        # Argo 节点：使用当前隧道域名
-                        local ws_path=$(echo "$node" | jq -r '.transport.path')
-                        local encoded_path=$(_url_encode "$ws_path")
-                        
-                        # 获取当前隧道域名
-                        local argo_domain=""
-                        if [ -f "$ARGO_LOG_FILE" ]; then
-                            argo_domain=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' "$ARGO_LOG_FILE" 2>/dev/null | tail -1 | sed 's|https://||')
+                    local ws_path=$(echo "$node" | jq -r '.transport.path')
+                    local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
+                    url="trojan://${password}@${link_ip}:${port}?security=tls&type=ws&host=${sn}&path=$(_url_encode "$ws_path")&sni=${sn}#$(_url_encode "$display_name")"
+                    
+                    # [!] 处理 Argo 节点
+                    local is_argo=$(jq -r --arg t "$tag" '.[$t].isArgo // false' "$METADATA_FILE")
+                    if [ "$is_argo" == "true" ]; then
+                        local argo_domain=$(jq -r --arg t "$tag" '.[$t].argoDomain' "$METADATA_FILE")
+                        if [ -n "$argo_domain" ] && [ "$argo_domain" != "null" ]; then
+                            url="trojan://${password}@${argo_domain}:443?security=tls&type=ws&host=${argo_domain}&path=$(_url_encode "$ws_path")&sni=${argo_domain}#$(_url_encode "$display_name")"
                         fi
-                        
-                        if [ -n "$argo_domain" ]; then
-                            url="trojan://$(_url_encode "$password")@${argo_domain}:443?security=tls&type=ws&host=${argo_domain}&path=${encoded_path}&sni=${argo_domain}#$(_url_encode "$display_name")"
-                        else
-                            # 隧道未运行，从元数据获取保存的域名
-                            local saved_domain=$(jq -r ".\"$tag\".domain // empty" "$ARGO_METADATA_FILE" 2>/dev/null)
-                            if [ -n "$saved_domain" ]; then
-                                url="trojan://$(_url_encode "$password")@${saved_domain}:443?security=tls&type=ws&host=${saved_domain}&path=${encoded_path}&sni=${saved_domain}#$(_url_encode "$display_name")"
-                                _warning "  [隧道未运行] 使用保存的域名"
-                            else
-                                _warning "  [Argo 节点] 隧道未运行，无法生成链接"
-                            fi
-                        fi
-                    else
-                        # 普通 Trojan + WS + TLS
-                        local server_addr=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .server' ${CLASH_YAML_FILE} | head -n 1)
-                        local host_header=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .ws-opts.headers.Host' ${CLASH_YAML_FILE} | head -n 1)
-                        local client_port=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .port' ${CLASH_YAML_FILE} | head -n 1)
-                        local ws_path=$(echo "$node" | jq -r '.transport.path')
-                        local encoded_path=$(_url_encode "$ws_path")
-                        local sni=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .sni' ${CLASH_YAML_FILE} | head -n 1)
-                        url="trojan://$(_url_encode "$password")@${server_addr}:${client_port}?security=tls&type=ws&host=${host_header}&path=${encoded_path}&sni=${sni}#$(_url_encode "$display_name")"
                     fi
                 else
-                    # Trojan (TCP)
-                    _info "  类型: Trojan (TCP), 地址: $display_server, 端口: $port, 密码: [已隐藏]"
+                    local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
+                    url="trojan://${password}@${link_ip}:${port}?security=tls&type=tcp&sni=${sn}#$(_url_encode "$display_name")"
                 fi
                 ;;
-
             "hysteria2")
                 local pw=$(echo "$node" | jq -r '.users[0].password');
-                local sn=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .sni' ${CLASH_YAML_FILE} | head -n 1)
+                local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
                 local meta=$(jq -r --arg t "$tag" '.[$t]' "$METADATA_FILE");
                 local op=$(echo "$meta" | jq -r '.obfsPassword')
                 local obfs_param=""; [[ -n "$op" && "$op" != "null" ]] && obfs_param="&obfs=salamander&obfs-password=${op}"
-                # [!] 已修改：使用 display_name
-                url="hysteria2://${pw}@${link_ip}:${port}?sni=${sn}&insecure=1${obfs_param}#$(_url_encode "$display_name")"
+                # 端口跳跃参数
+                local hop=$(echo "$meta" | jq -r '.portHopping // empty')
+                local hop_param=""; [[ -n "$hop" && "$hop" != "null" ]] && hop_param="&mport=${hop}"
+                url="hysteria2://${pw}@${link_ip}:${port}?sni=${sn}&insecure=1${obfs_param}${hop_param}#$(_url_encode "$display_name")"
                 ;;
             "tuic")
                 local uuid=$(echo "$node" | jq -r '.users[0].uuid'); local pw=$(echo "$node" | jq -r '.users[0].password')
-                local sn=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .sni' ${CLASH_YAML_FILE} | head -n 1)
-                # [!] 已修改：使用 display_name
+                local sn=$(_get_proxy_field "$proxy_name_to_find" ".sni")
                 url="tuic://${uuid}:${pw}@${link_ip}:${port}?sni=${sn}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "$display_name")"
                 ;;
             "anytls")
                 local pw=$(echo "$node" | jq -r '.users[0].password')
                 local sn=$(echo "$node" | jq -r '.tls.server_name')
-                local skip_verify=$(${YQ_BINARY} eval '.proxies[] | select(.name == "'${proxy_name_to_find}'") | .skip-cert-verify' ${CLASH_YAML_FILE} | head -n 1)
+                local skip_verify=$(_get_proxy_field "$proxy_name_to_find" ".skip-cert-verify")
                 local insecure_param=""
                 if [ "$skip_verify" == "true" ]; then
                     insecure_param="&insecure=1&allowInsecure=1"
                 fi
-                # [!] 生成 AnyTLS 分享链接
                 url="anytls://${pw}@${link_ip}:${port}?security=tls&sni=${sn}${insecure_param}&type=tcp#$(_url_encode "$display_name")"
                 ;;
             "shadowsocks")
                 local method=$(echo "$node" | jq -r '.method')
                 local password=$(echo "$node" | jq -r '.password')
-                
-                # 保持原格式：ss://method:password@server:port#name (URL编码)
-                # [!] 已修改：使用 display_name
                 url="ss://$(_url_encode "${method}:${password}")@${link_ip}:${port}#$(_url_encode "$display_name")"
                 ;;
             "socks")
@@ -2188,8 +2359,25 @@ _view_nodes() {
                 ;;
         esac
         [ -n "$url" ] && echo -e "  ${YELLOW}分享链接:${NC} ${url}"
+        # 收集链接到临时文件
+        [ -n "$url" ] && echo "$url" >> /tmp/singbox_links.tmp
     done
     echo "-------------------------------------"
+    
+    # 生成聚合 Base64 选项
+    if [ -f /tmp/singbox_links.tmp ]; then
+        echo ""
+        read -p "是否生成聚合 Base64 订阅? (y/N): " gen_base64
+        if [[ "$gen_base64" == "y" || "$gen_base64" == "Y" ]]; then
+            echo ""
+            _info "=== 聚合 Base64 订阅 ==="
+            local base64_result=$(cat /tmp/singbox_links.tmp | base64 -w 0)
+            echo -e "${CYAN}${base64_result}${NC}"
+            echo ""
+            _success "可直接复制上方内容导入 v2rayN 等客户端"
+        fi
+        rm -f /tmp/singbox_links.tmp
+    fi
 }
 
 _delete_node() {
@@ -2205,8 +2393,14 @@ _delete_node() {
     
     local i=1
     # [!] 已修改：使用进程替换 < <(...) 来避免 subshell，确保数组在循环外可用
+    local i=1
+    # [!] 已修改：使用进程替换 < <(...) 来避免 subshell，确保数组在循环外可用
     while IFS= read -r node; do
         local tag=$(echo "$node" | jq -r '.tag') 
+        
+        # [!] 过滤辅助节点
+        if [[ "$tag" == *"-hop-"* ]]; then continue; fi
+        
         local type=$(echo "$node" | jq -r '.type') 
         local port=$(echo "$node" | jq -r '.listen_port')
         
@@ -2237,13 +2431,50 @@ _delete_node() {
         ((i++))
     done < <(jq -c '.inbounds[]' "$CONFIG_FILE") # [!] 已修改：使用 < <(...) 
     # --- 列表逻辑结束 ---
+    
+    # 添加删除所有选项
+    local count=${#inbound_tags[@]}
+    echo ""
+    echo -e "  ${RED}99)${NC} 删除所有节点"
 
     read -p "请输入要删除的节点编号 (输入 0 返回): " num
     
     [[ ! "$num" =~ ^[0-9]+$ ]] || [ "$num" -eq 0 ] && return
     
+    # 处理删除所有节点
+    if [ "$num" -eq 99 ]; then
+        read -p "$(echo -e ${RED}"确定要删除所有节点吗? 此操作不可恢复! (输入 yes 确认): "${NC})" confirm_all
+        if [ "$confirm_all" != "yes" ]; then
+            _info "删除已取消。"
+            return
+        fi
+        
+        _info "正在删除所有节点..."
+        
+        # 清空配置
+        _atomic_modify_json "$CONFIG_FILE" '.inbounds = []'
+        _atomic_modify_json "$METADATA_FILE" '{}'
+        
+        # 清空 clash.yaml 中的代理
+        ${YQ_BINARY} eval '.proxies = []' -i "$CLASH_YAML_FILE"
+        ${YQ_BINARY} eval '.proxy-groups[] |= (select(.name == "节点选择") | .proxies = ["DIRECT"])' -i "$CLASH_YAML_FILE"
+        
+        # 删除所有证书文件
+        rm -f ${SINGBOX_DIR}/*.pem ${SINGBOX_DIR}/*.key 2>/dev/null
+        
+        # 清空 iptables NAT PREROUTING 规则 (清除端口跳跃规则)
+        if command -v iptables &>/dev/null; then
+            _info "正在清理 iptables NAT PREROUTING 规则..."
+            iptables -t nat -F PREROUTING 2>/dev/null
+            _save_iptables_rules
+        fi
+        
+        _success "所有节点已删除！"
+        _manage_service "restart"
+        return
+    fi
+    
     # [!] 已修改：现在 count 会在循环外被正确计算
-    local count=${#inbound_tags[@]}
     if [ "$num" -gt "$count" ]; then _error "编号超出范围。"; return; fi
 
     local index=$((num - 1))
@@ -2282,9 +2513,13 @@ _delete_node() {
         node_type=$(echo "$node_metadata" | jq -r '.type // empty')
     fi
     
-    # [!] 已修改：使用索引从 config.json 中删除
-    _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[${index}])" || return
-    _atomic_modify_json "$METADATA_FILE" "del(.\"$tag_to_del\")" || return # Metadata 仍然使用 tag，这是正确的
+    # [!] 重要修正：不使用索引删除（因为列表已过滤），改为使用 Tag 精确匹配删除
+    _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag_to_del\"))" || return
+    
+    # [!] 新增：级联删除关联的辅助端口监听节点 (格式: tag-hop-xxx)
+    _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag | startswith(\"$tag_to_del-hop-\")))"
+    
+    _atomic_modify_json "$METADATA_FILE" "del(.\"$tag_to_del\")" || return
     
     # [!] 已修改：使用找到的 proxy_name_to_del 从 clash.yaml 中删除
     if [ -n "$proxy_name_to_del" ]; then
@@ -3192,37 +3427,81 @@ _advanced_features() {
 _main_menu() {
     while true; do
         clear
-        echo "===================================================="
-        _info "        sing-box 全功能管理脚本 v${SCRIPT_VERSION}"
-        echo "===================================================="
-        _info "【节点管理】"
-        echo "  1) 添加节点"
-        echo -e "  2) ${CYAN}Argo 隧道节点${NC}"
-        echo "  3) 查看节点分享链接"
-        echo "  4) 删除节点"
-        echo "  5) 修改节点端口"
-        echo "  6) 导入第三方节点"
-        echo "----------------------------------------------------"
-        _info "【服务控制】"
-        echo "  7) 重启 sing-box"
-        echo "  8) 停止 sing-box"
-        echo "  9) 查看 sing-box 运行状态"
-        echo " 10) 查看 sing-box 实时日志"
-        echo "----------------------------------------------------"
-        _info "【脚本与配置】"
-        echo " 11) 检查配置文件"
-        echo "----------------------------------------------------"
-        _info "【更新与卸载】"
-        echo -e " 12) ${GREEN}更新脚本${NC}"
-        echo -e " 13) ${GREEN}更新 Sing-box 核心${NC}"
-        echo -e " 14) ${RED}卸载 sing-box 及脚本${NC}"
-        echo "----------------------------------------------------"
-        _info "【进阶功能】"
-        echo -e " 15) ${CYAN}进阶功能 (落地/中转配置)${NC}"
-        echo "----------------------------------------------------"
-        echo "  0) 退出脚本"
-        echo "===================================================="
-        read -p "请输入选项 [0-15]: " choice
+        # ASCII Logo
+        echo -e "${CYAN}"
+        echo '  ____  _             ____            '
+        echo ' / ___|(_)_ __   __ _| __ )  _____  __'
+        echo ' \___ \| | '\''_ \ / _` |  _ \ / _ \ \/ /'
+        echo '  ___) | | | | | (_| | |_) | (_) >  < '
+        echo ' |____/|_|_| |_|\__, |____/ \___/_/\_\'
+        echo '                |___/    Lite Manager '
+        echo -e "${NC}"
+        
+        # 版本标题
+        echo -e "${CYAN}"
+        echo "  ╔═══════════════════════════════════════╗"
+        echo "  ║         sing-box 管理脚本 v${SCRIPT_VERSION}        ║"
+        echo "  ╚═══════════════════════════════════════╝"
+        echo -e "${NC}"
+        echo ""
+        
+        # 获取系统信息
+        local os_info="未知"
+        if [ -f /etc/os-release ]; then
+            os_info=$(grep -E "^PRETTY_NAME=" /etc/os-release 2>/dev/null | cut -d'"' -f2 | head -1)
+            [ -z "$os_info" ] && os_info=$(grep -E "^NAME=" /etc/os-release 2>/dev/null | cut -d'"' -f2 | head -1)
+        fi
+        [ -z "$os_info" ] && os_info=$(uname -s)
+        
+        # 获取服务状态
+        local service_status="○ 未知"
+        if [ "$INIT_SYSTEM" == "systemd" ]; then
+            if systemctl is-active --quiet sing-box 2>/dev/null; then
+                service_status="${GREEN}● 运行中${NC}"
+            else
+                service_status="${RED}○ 已停止${NC}"
+            fi
+        elif [ "$INIT_SYSTEM" == "openrc" ]; then
+            if rc-service sing-box status 2>/dev/null | grep -q "started"; then
+                service_status="${GREEN}● 运行中${NC}"
+            else
+                service_status="${RED}○ 已停止${NC}"
+            fi
+        fi
+        
+        echo -e "  系统: ${CYAN}${os_info}${NC}  |  模式: ${CYAN}${INIT_SYSTEM}${NC}"
+        echo -e "  服务状态: ${service_status}"
+        echo ""
+        
+        # 节点管理
+        echo -e "  ${CYAN}【节点管理】${NC}"
+        echo -e "    ${GREEN}[1]${NC} 添加节点          ${GREEN}[2]${NC} Argo 隧道节点"
+        echo -e "    ${GREEN}[3]${NC} 查看节点链接      ${GREEN}[4]${NC} 删除节点"
+        echo -e "    ${GREEN}[5]${NC} 修改节点端口      ${GREEN}[6]${NC} 导入第三方节点"
+        echo ""
+        
+        # 服务控制
+        echo -e "  ${CYAN}【服务控制】${NC}"
+        echo -e "    ${GREEN}[7]${NC} 重启服务          ${GREEN}[8]${NC} 停止服务"
+        echo -e "    ${GREEN}[9]${NC} 查看运行状态     ${GREEN}[10]${NC} 查看实时日志"
+        echo ""
+        
+        # 配置与更新
+        echo -e "  ${CYAN}【配置与更新】${NC}"
+        echo -e "   ${GREEN}[11]${NC} 检查配置文件     ${GREEN}[12]${NC} 更新脚本"
+        echo -e "   ${GREEN}[13]${NC} 更新核心         ${RED}[14]${NC} 卸载脚本"
+        echo ""
+        
+        # 进阶功能
+        echo -e "  ${CYAN}【进阶功能】${NC}"
+        echo -e "   ${GREEN}[15]${NC} 落地/中转配置"
+        echo ""
+        
+        echo -e "  ─────────────────────────────────────────────────"
+        echo -e "    ${YELLOW}[0]${NC} 退出脚本"
+        echo ""
+        
+        read -p "  请输入选项 [0-15]: " choice
 
         case $choice in
             1) _show_add_node_menu ;;
@@ -3248,26 +3527,299 @@ _main_menu() {
     done
 }
 
+# 批量创建节点
+_batch_create_nodes() {
+    clear
+    echo -e "${CYAN}"
+    echo '  ╔═══════════════════════════════════════╗'
+    echo '  ║          批量创建节点                 ║'
+    echo '  ╚═══════════════════════════════════════╝'
+    echo -e "${NC}"
+    echo ""
+    
+    # 1. 输入服务器 IP
+    read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
+    local node_ip=${custom_ip:-$server_ip}
+    
+    # 2. 从这里开始，调整交互顺序
+    local start_port=""
+    while true; do
+        echo ""
+        read -p "请输入批量创建节点的起始端口 (将占用连续4个端口): " input_port
+        start_port="$input_port"
+        
+        if [[ -z "$start_port" ]]; then
+             _error "起始端口不能为空！"
+             continue
+        fi
+        
+        if [[ "$start_port" =~ ^[0-9]+$ ]]; then
+            if [ "$start_port" -lt 1 ] || [ "$start_port" -gt 65500 ]; then
+                 _error "端口必须在 1-65500 之间"
+            else
+                 break
+            fi
+        else
+            _error "输入错误！请输入单个数字端口号（例如 11000），不要输入范围！"
+        fi
+    done
+    
+    local batch_end_port=$((start_port + 3))
+    _info "批量协议将占用端口范围: ${CYAN}${start_port} - ${batch_end_port}${NC}"
+    
+    # 3. (新增) 输入自定义 SNI
+    read -p "请输入伪装域名 (SNI) (默认: www.microsoft.com): " input_sni
+    local custom_sni=${input_sni:-"www.microsoft.com"}
+    
+    # 4. (调整) 询问是否开启 Hysteria2 端口跳跃
+    local hy2_port_hopping=""
+    local hy2_hop_start=""
+    local hy2_hop_end=""
+    
+    echo ""
+    read -p "是否开启 Hysteria2 端口跳跃? (y/N): " hop_choice
+    if [[ "$hop_choice" == "y" || "$hop_choice" == "Y" ]]; then
+        _info "请注意：跳跃范围不能包含 ${start_port}-${batch_end_port}"
+        read -p "请输入端口跳跃范围 (格式: 起始端口-结束端口, 例如 20000-30000): " hop_range
+        if [[ "$hop_range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+            hy2_hop_start="${BASH_REMATCH[1]}"
+            hy2_hop_end="${BASH_REMATCH[2]}"
+            
+            # 冲突检测
+            if [ "$hy2_hop_start" -lt "$hy2_hop_end" ]; then
+                # 检查是否重叠
+                if [ "$start_port" -ge "$hy2_hop_start" ] && [ "$start_port" -le "$hy2_hop_end" ] || \
+                   [ "$batch_end_port" -ge "$hy2_hop_start" ] && [ "$batch_end_port" -le "$hy2_hop_end" ]; then
+                   _error "错误：跳跃范围 ${hop_range} 与主端口范围 ${start_port}-${batch_end_port} 冲突！"
+                   _warning "端口跳跃将不会启用。"
+                   hy2_port_hopping=""
+                   hy2_hop_start=""
+                   hy2_hop_end=""
+                else
+                   hy2_port_hopping="$hop_range"
+                   _success "端口跳跃范围确认: ${hy2_hop_start}-${hy2_hop_end}"
+                fi
+            else
+                _error "端口范围无效 (起始必须小于结束)，端口跳跃未启用"
+            fi
+        else
+            _error "端口范围格式错误，端口跳跃未启用"
+        fi
+    fi
+    
+    # 4. 显示将要创建的节点
+    echo ""
+    _info "将创建以下节点："
+    echo -e "    ${GREEN}[1]${NC} VLESS Reality    端口: $((start_port))"
+    echo -e "    ${GREEN}[2]${NC} Hysteria2        端口: $((start_port + 1))"
+    if [ -n "$hy2_port_hopping" ]; then
+        echo -e "        └─ 端口跳跃: ${hy2_port_hopping}"
+    fi
+    echo -e "    ${GREEN}[3]${NC} TUIC             端口: $((start_port + 2))"
+    echo -e "    ${GREEN}[4]${NC} Shadowsocks      端口: $((start_port + 3))"
+    echo ""
+    
+    read -p "确认创建? (Y/n): " confirm
+    if [[ "$confirm" == "n" || "$confirm" == "N" ]]; then
+        _warning "已取消批量创建"
+        return 1
+    fi
+    
+    # 5. 开始批量创建
+    local port=$start_port
+    local success_count=0
+    local name_prefix="Batch"
+    
+    # VLESS Reality
+    _info "正在创建 VLESS Reality..."
+    local tag="vless-in-${port}"
+    local uuid=$(${SINGBOX_BIN} generate uuid)
+    local keypair=$(${SINGBOX_BIN} generate reality-keypair)
+    local pk=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
+    local pbk=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
+    local sid=$(${SINGBOX_BIN} generate rand --hex 8)
+    local sni="$custom_sni"
+    local flow="xtls-rprx-vision"
+    
+    local inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg f "$flow" --arg sn "$sni" --arg pk "$pk" --arg sid "$sid" \
+        '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":$f}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
+    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]"
+    
+    local meta_json=$(jq -n --arg pk "$pbk" --arg sid "$sid" '{"publicKey": $pk, "shortId": $sid}')
+    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}"
+    
+    local proxy_json=$(jq -n --arg n "${name_prefix}-Reality-${port}" --arg s "$node_ip" --arg p "$port" --arg u "$uuid" --arg sn "$sni" --arg pk "$pbk" --arg sid "$sid" --arg f "$flow" \
+        '{"name":$n,"type":"vless","server":$s,"port":($p|tonumber),"uuid":$u,"flow":$f,"tls":true,"servername":$sn,"reality-opts":{"public-key":$pk,"short-id":$sid},"client-fingerprint":"chrome","network":"tcp"}')
+    _add_node_to_yaml "$proxy_json"
+    success_count=$((success_count + 1))
+    
+    # Hysteria2
+    port=$((start_port + 1))
+    _info "正在创建 Hysteria2..."
+    tag="hy2-in-${port}"
+    local password=$(${SINGBOX_BIN} generate rand --hex 16)
+    local cert_path="${SINGBOX_DIR}/${tag}.pem"
+    local key_path="${SINGBOX_DIR}/${tag}.key"
+    sni="$custom_sni"
+    
+    _generate_self_signed_cert "$sni" "$cert_path" "$key_path"
+    
+    inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" \
+        '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
+    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]"
+    
+    # 配置端口跳跃
+    if [ -n "$hy2_port_hopping" ]; then
+        local hop_count=$((hy2_hop_end - hy2_hop_start + 1))
+        local use_multiport="false"
+
+        if [ "$hop_count" -le 50 ]; then
+             _info "端口范围较小 (${hop_count} 个)，将使用 多端口监听模式 (兼容 LXC 和 NAT VPS)..."
+             use_multiport="true"
+             
+             _info "正在生成多端口监听配置 (${hy2_hop_start}-${hy2_hop_end})..."
+             
+             # 使用 Bash 循环构建 JSON 数组
+             local multi_json_array="["
+             local first=true
+             
+             for ((p=hy2_hop_start; p<=hy2_hop_end; p++)); do
+                 # 跳过主端口
+                 if [ "$p" -eq "$port" ]; then continue; fi
+                 
+                 if [ "$first" = true ]; then first=false; else multi_json_array+=","; fi
+                 
+                 local hop_tag="${tag}-hop-${p}"
+                 local item_json=$(jq -n --arg t "$hop_tag" --arg p "$p" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" \
+                    '{
+                        "type": "hysteria2",
+                        "tag": $t,
+                        "listen": "::",
+                        "listen_port": ($p|tonumber),
+                        "users": [{"password": $pw}],
+                        "tls": {
+                            "enabled": true,
+                            "alpn": ["h3"],
+                            "certificate_path": $cert,
+                            "key_path": $key
+                        }
+                    }')
+                 multi_json_array+="$item_json"
+             done
+             multi_json_array+="]"
+
+             _atomic_modify_json "$CONFIG_FILE" ".inbounds += $multi_json_array"
+             _success "已添加 ${hop_count} 个辅助监听端口"
+        else
+            _info "端口范围较大，将尝试使用 iptables 转发模式..."
+            if ! _ensure_iptables; then
+                _warning "iptables 不可用，端口跳跃配置跳过。"
+            else
+                _info "正在配置端口跳跃 iptables 规则..."
+                iptables -t nat -A PREROUTING -p udp --dport ${hy2_hop_start}:${hy2_hop_end} -j DNAT --to-destination 127.0.0.1:${port}
+                if [ $? -eq 0 ]; then
+                    _success "iptables 规则已添加"
+                    _save_iptables_rules
+                else
+                    _warning "iptables 规则添加失败"
+                    _warning "可能原因：系统未加载 ip_tables/iptable_nat 模块，或 LXC 容器无权限"
+                fi
+            fi
+        fi
+    fi
+    
+    meta_json=$(jq -n --arg up "100 Mbps" --arg down "200 Mbps" --arg hop "$hy2_port_hopping" \
+        '{"up": $up, "down": $down} | if $hop != "" then .portHopping = $hop else . end')
+    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}"
+    
+    proxy_json=$(jq -n --arg n "${name_prefix}-Hy2-${port}" --arg s "$node_ip" --arg p "$port" --arg pw "$password" --arg sn "$sni" --arg hop "$hy2_port_hopping" \
+        '{"name":$n,"type":"hysteria2","server":$s,"port":($p|tonumber),"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"up":"100 Mbps","down":"200 Mbps"} | if $hop != "" then .ports = $hop else . end')
+    _add_node_to_yaml "$proxy_json"
+    success_count=$((success_count + 1))
+    
+    # TUIC
+    port=$((start_port + 2))
+    _info "正在创建 TUIC..."
+    tag="tuic-in-${port}"
+    uuid=$(${SINGBOX_BIN} generate uuid)
+    password=$(${SINGBOX_BIN} generate rand --hex 16)
+    cert_path="${SINGBOX_DIR}/${tag}.pem"
+    key_path="${SINGBOX_DIR}/${tag}.key"
+    sni="$custom_sni"
+    
+    _generate_self_signed_cert "$sni" "$cert_path" "$key_path"
+    
+    inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$sni" --arg cert "$cert_path" --arg key "$key_path" \
+        '{"type":"tuic","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"password":$pw}],"congestion_control":"bbr","tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
+    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]"
+    
+    proxy_json=$(jq -n --arg n "${name_prefix}-TUIC-${port}" --arg s "$node_ip" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$sni" \
+        '{"name":$n,"type":"tuic","server":$s,"port":($p|tonumber),"uuid":$u,"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"congestion-controller":"bbr","udp-relay-mode":"native"}')
+    _add_node_to_yaml "$proxy_json"
+    success_count=$((success_count + 1))
+    
+    # Shadowsocks
+    port=$((start_port + 3))
+    _info "正在创建 Shadowsocks..."
+    tag="ss-in-${port}"
+    password=$(${SINGBOX_BIN} generate rand --base64 16)
+    local method="2022-blake3-aes-128-gcm"
+    
+    inbound_json=$(jq -n --arg t "$tag" --arg p "$port" --arg pw "$password" --arg m "$method" \
+        '{"type":"shadowsocks","tag":$t,"listen":"::","listen_port":($p|tonumber),"method":$m,"password":$pw}')
+    _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json]"
+    
+    proxy_json=$(jq -n --arg n "${name_prefix}-SS-${port}" --arg s "$node_ip" --arg p "$port" --arg pw "$password" --arg m "$method" \
+        '{"name":$n,"type":"ss","server":$s,"port":($p|tonumber),"cipher":$m,"password":$pw}')
+    _add_node_to_yaml "$proxy_json"
+    success_count=$((success_count + 1))
+    
+    # 6. 完成
+    echo ""
+    _success "批量创建完成！成功创建 ${success_count} 个节点"
+    
+    # 重启服务
+    _info "正在重启服务..."
+    _manage_service "restart"
+    
+    echo ""
+    _info "使用 [查看节点链接] 可查看所有节点的分享链接"
+    
+    return 0
+}
+
 _show_add_node_menu() {
     local needs_restart=false
     local action_result
     clear
-    echo "========================================"
-    _info "           sing-box 添加节点"
-    echo "========================================"
-    echo " 1) VLESS (Vision+REALITY)"
-    echo " 2) VLESS (WebSocket+TLS)"
-    echo " 3) Trojan (WebSocket+TLS)"
-    echo " 4) AnyTLS"
-    echo " 5) Hysteria2"
-    echo " 6) TUICv5"
-    echo " 7) Shadowsocks"
-    echo " 8) VLESS (TCP)"
-    echo " 9) SOCKS5"
-    echo "----------------------------------------"
-    echo " 0) 返回主菜单"
-    echo "========================================"
-    read -p "请输入选项 [0-9]: " choice
+    echo -e "${CYAN}"
+    echo '  ╔═══════════════════════════════════════╗'
+    echo '  ║          sing-box 添加节点            ║'
+    echo '  ╚═══════════════════════════════════════╝'
+    echo -e "${NC}"
+    echo ""
+    
+    echo -e "  ${CYAN}【协议选择】${NC}"
+    echo -e "    ${GREEN}[1]${NC} VLESS (Vision+REALITY)"
+    echo -e "    ${GREEN}[2]${NC} VLESS (WebSocket+TLS)"
+    echo -e "    ${GREEN}[3]${NC} Trojan (WebSocket+TLS)"
+    echo -e "    ${GREEN}[4]${NC} AnyTLS"
+    echo -e "    ${GREEN}[5]${NC} Hysteria2"
+    echo -e "    ${GREEN}[6]${NC} TUICv5"
+    echo -e "    ${GREEN}[7]${NC} Shadowsocks"
+    echo -e "    ${GREEN}[8]${NC} VLESS (TCP)"
+    echo -e "    ${GREEN}[9]${NC} SOCKS5"
+    echo ""
+    
+    echo -e "  ${CYAN}【快捷功能】${NC}"
+    echo -e "   ${GREEN}[10]${NC} 批量创建节点"
+    echo ""
+    
+    echo -e "  ─────────────────────────────────────────"
+    echo -e "    ${YELLOW}[0]${NC} 返回主菜单"
+    echo ""
+    
+    read -p "  请输入选项 [0-10]: " choice
 
     case $choice in
         1) _add_vless_reality; action_result=$? ;;
@@ -3279,6 +3831,7 @@ _show_add_node_menu() {
         7) _add_shadowsocks_menu; action_result=$? ;;
         8) _add_vless_tcp; action_result=$? ;;
         9) _add_socks; action_result=$? ;;
+        10) _batch_create_nodes; return ;;
         0) return ;;
         *) _error "无效输入，请重试。" ;;
     esac
