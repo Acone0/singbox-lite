@@ -1965,8 +1965,9 @@ _add_hysteria2() {
     _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
     
     read -p "请输入密码 (默认随机): " password; password=${password:-$(${SINGBOX_BIN} generate rand --hex 16)}
-    read -p "请输入上传速度 (默认 100 Mbps): " up_speed; up_speed=${up_speed:-"100 Mbps"}
-    read -p "请输入下载速度 (默认 200 Mbps): " down_speed; down_speed=${down_speed:-"200 Mbps"}
+    # 服务端配置不限速，仅询问用于生成分享链接（默认给高值）
+    read -p "请输入客户端期望上传速度 (默认 1000 Mbps): " up_speed; up_speed=${up_speed:-"1000 Mbps"}
+    read -p "请输入客户端期望下载速度 (默认 1000 Mbps): " down_speed; down_speed=${down_speed:-"1000 Mbps"}
     
     local obfs_password=""
     read -p "是否开启 QUIC 流量混淆 (salamander)? (y/N): " choice
@@ -1993,8 +1994,8 @@ _add_hysteria2() {
                 local hop_count=$((port_range_end - port_range_start + 1))
                 local use_multiport="false"
 
-                if [ "$hop_count" -le 50 ]; then
-                    _info "端口范围较小 (${hop_count} 个)，将使用 多端口监听模式 (兼容 LXC 和 NAT VPS)..."
+                if [ "$hop_count" -le 1000 ]; then
+                    _info "端口范围适中 (${hop_count} 个)，将使用 多端口监听模式 (兼容 LXC 和 NAT VPS)..."
                     use_multiport="true"
                 else
                     _info "端口范围较大，将尝试使用 iptables 转发模式..."
@@ -3673,8 +3674,8 @@ _batch_create_nodes() {
         local hop_count=$((hy2_hop_end - hy2_hop_start + 1))
         local use_multiport="false"
 
-        if [ "$hop_count" -le 50 ]; then
-             _info "端口范围较小 (${hop_count} 个)，将使用 多端口监听模式 (兼容 LXC 和 NAT VPS)..."
+        if [ "$hop_count" -le 1000 ]; then
+             _info "端口范围适中 (${hop_count} 个)，将使用 多端口监听模式 (兼容 LXC 和 NAT VPS)..."
              use_multiport="true"
              
              _info "正在生成多端口监听配置 (${hy2_hop_start}-${hy2_hop_end})..."
@@ -3728,12 +3729,12 @@ _batch_create_nodes() {
         fi
     fi
     
-    meta_json=$(jq -n --arg up "100 Mbps" --arg down "200 Mbps" --arg hop "$hy2_port_hopping" \
-        '{"up": $up, "down": $down} | if $hop != "" then .portHopping = $hop else . end')
+    meta_json=$(jq -n --arg hop "$hy2_port_hopping" \
+        '{"up": "1000 Mbps", "down": "1000 Mbps"} | if $hop != "" then .portHopping = $hop else . end')
     _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}"
     
     proxy_json=$(jq -n --arg n "${name_prefix}-Hy2-${port}" --arg s "$node_ip" --arg p "$port" --arg pw "$password" --arg sn "$sni" --arg hop "$hy2_port_hopping" \
-        '{"name":$n,"type":"hysteria2","server":$s,"port":($p|tonumber),"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"up":"100 Mbps","down":"200 Mbps"} | if $hop != "" then .ports = $hop else . end')
+        '{"name":$n,"type":"hysteria2","server":$s,"port":($p|tonumber),"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"up":"1000 Mbps","down":"1000 Mbps"} | if $hop != "" then .ports = $hop else . end')
     _add_node_to_yaml "$proxy_json"
     success_count=$((success_count + 1))
     
