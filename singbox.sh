@@ -295,94 +295,133 @@ _install_cloudflared() {
 
 _start_argo_tunnel() {
     local target_port="$1"
-    local protocol="$2"  # vless-ws 或 trojan-ws
+    local protocol="$2"
+    local token="$3" # 可选，用于固定隧道
     
-    # 检查是否已有隧道在运行
-    if [ -f "$ARGO_PID_FILE" ] && kill -0 $(cat "$ARGO_PID_FILE") 2>/dev/null; then
-        _warning "已有 Argo 隧道在运行 (PID: $(cat $ARGO_PID_FILE))"
-        return 1
+    # 基于端口生成独立的 PID 和日志文件路径
+    local pid_file="/tmp/singbox_argo_${target_port}.pid"
+    local log_file="/tmp/singbox_argo_${target_port}.log"
+    
+    _info "正在启动 Argo 隧道 (端口: $target_port)..." >&2
+    
+    # 检查该端口对应的隧道是否已在运行
+    if [ -f "$pid_file" ]; then
+        local old_pid=$(cat "$pid_file" 2>/dev/null)
+        if [ -n "$old_pid" ] && kill -0 "$old_pid" 2>/dev/null; then
+            _warning "检测到端口 $target_port 的 Argo 隧道已在运行 (PID: $old_pid)" >&2
+            return 0
+        fi
     fi
     
     # 清理旧日志
-    rm -f "${ARGO_LOG_FILE}"
+    rm -f "${log_file}"
     
-    _info "正在启动 Argo 隧道，指向 localhost:${target_port}..."
-    
-    # 启动临时隧道，后台运行
-    ${CLOUDFLARED_BIN} tunnel --url "http://localhost:${target_port}" \
-        --logfile "${ARGO_LOG_FILE}" \
-        > /dev/null 2>&1 &
-    
-    local cf_pid=$!
-    echo "$cf_pid" > "${ARGO_PID_FILE}"
-    
-    # 等待隧道启动并获取域名
-    _info "等待隧道建立 (最多30秒)..."
-    
-    local tunnel_domain=""
-    local wait_count=0
-    local max_wait=30
-    
-    while [ $wait_count -lt $max_wait ]; do
-        sleep 2
-        wait_count=$((wait_count + 2))
+    if [ -n "$token" ]; then
+        # --- Token 固定隧道模式 ---
+        _info "启动固定隧道 (Token 模式)..." >&2
         
-        # 检查进程是否还在运行
+        # 注意: tunnel run --token 不需要 --url 参数
+        nohup ${CLOUDFLARED_BIN} tunnel run --token "$token" > "${log_file}" 2>&1 &
+            
+        local cf_pid=$!
+        echo "$cf_pid" > "${pid_file}"
+        
+        sleep 5
         if ! kill -0 "$cf_pid" 2>/dev/null; then
-            _error "cloudflared 进程已退出，请检查日志: ${ARGO_LOG_FILE}"
-            cat "${ARGO_LOG_FILE}" 2>/dev/null | tail -20
+             _error "cloudflared 进程已退出！" >&2
+             _error "Token 可能无效，或者网络连接被拒绝。" >&2
+             echo "--- 错误日志 (最后 20 行) ---" >&2
+             cat "${log_file}" | tail -20 >&2
+             echo "-----------------------------"
+             return 1
+        fi
+        _success "Argo 固定隧道 (端口: $target_port) 启动成功!" >&2
+        return 0
+    else
+        # --- URL 临时隧道模式 ---
+        _info "启动临时隧道，指向 localhost:${target_port}..." >&2
+        
+        # 启动临时隧道
+        nohup ${CLOUDFLARED_BIN} tunnel --url "http://localhost:${target_port}" \
+            --logfile "${log_file}" \
+            > /dev/null 2>&1 &
+        
+        local cf_pid=$!
+        echo "$cf_pid" > "${pid_file}"
+        
+        # 等待隧道启动并获取域名
+        _info "等待隧道建立 (最多30秒)..." >&2
+        
+        local tunnel_domain=""
+        local wait_count=0
+        local max_wait=30
+        
+        while [ $wait_count -lt $max_wait ]; do
+            sleep 2
+            wait_count=$((wait_count + 2))
+            
+            # 检查进程是否还在运行
+            if ! kill -0 "$cf_pid" 2>/dev/null; then
+                _error "cloudflared 进程已退出，请检查日志: ${log_file}" >&2
+                cat "${log_file}" 2>/dev/null | tail -20 >&2
+                return 1
+            fi
+            
+            # 提取域名
+            if [ -f "${log_file}" ]; then
+                tunnel_domain=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' "${log_file}" 2>/dev/null | tail -1 | sed 's|https://||')
+                if [ -n "$tunnel_domain" ]; then
+                    break
+                fi
+            fi
+            echo -n "." >&2
+        done
+        echo "" >&2
+        
+        if [ -n "$tunnel_domain" ]; then
+            _success "Argo 临时隧道建立成功: ${tunnel_domain}" >&2
+            echo "$tunnel_domain"
+            return 0
+        else
+            _error "获取临时域名超时。请检查网络。"
+            kill "$cf_pid" 2>/dev/null
+            rm -f "${pid_file}"
             return 1
         fi
-        
-        # 使用兼容方式提取域名 (不用 grep -P)
-        if [ -f "${ARGO_LOG_FILE}" ]; then
-            tunnel_domain=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' "${ARGO_LOG_FILE}" 2>/dev/null | tail -1 | sed 's|https://||')
-            if [ -n "$tunnel_domain" ]; then
-                break
-            fi
-        fi
-        
-        echo -n "."
-    done
-    echo ""
-    
-    if [ -z "$tunnel_domain" ]; then
-        _error "无法获取隧道域名 (超时)，请检查日志: ${ARGO_LOG_FILE}"
-        cat "${ARGO_LOG_FILE}" 2>/dev/null | tail -20
-        return 1
     fi
-    
-    _success "Argo 隧道启动成功!"
-    _success "隧道域名: ${tunnel_domain}"
-    
-    echo "$tunnel_domain"
 }
 
 _stop_argo_tunnel() {
-    if [ -f "$ARGO_PID_FILE" ]; then
-        local pid=$(cat "$ARGO_PID_FILE")
+    local target_port="$1"
+    if [ -z "$target_port" ]; then
+        return
+    fi
+    
+    local pid_file="/tmp/singbox_argo_${target_port}.pid"
+    local log_file="/tmp/singbox_argo_${target_port}.log"
+
+    if [ -f "$pid_file" ]; then
+        local pid=$(cat "$pid_file")
         if kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null
-            rm -f "$ARGO_PID_FILE"
-            _success "Argo 隧道已停止 (PID: $pid)"
-        else
-            rm -f "$ARGO_PID_FILE"
-            _warning "隧道进程已不存在"
+            _success "Argo 隧道 (端口: $target_port) 已停止"
         fi
-    else
-        # 尝试查找并杀死 cloudflared 进程
-        pkill -f "cloudflared tunnel" 2>/dev/null && _success "Argo 隧道已停止" || _warning "没有运行中的 Argo 隧道"
+        rm -f "$pid_file" "$log_file"
     fi
 }
 
-_get_argo_tunnel_status() {
-    if [ -f "$ARGO_PID_FILE" ] && kill -0 $(cat "$ARGO_PID_FILE") 2>/dev/null; then
-        local pid=$(cat "$ARGO_PID_FILE")
-        local tunnel_domain=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' "$ARGO_LOG_FILE" 2>/dev/null | tail -1 | sed 's|https://||')
-        echo "running:${pid}:${tunnel_domain}"
-    else
-        echo "stopped"
-    fi
+_stop_all_argo_tunnels() {
+    _info "正在停止所有 Argo 隧道..."
+    for pid_file in /tmp/singbox_argo_*.pid; do
+        [ -e "$pid_file" ] || continue
+        # 解析端口
+        local filename=$(basename "$pid_file")
+        local port=${filename#singbox_argo_}
+        port=${port%.pid}
+        _stop_argo_tunnel "$port"
+    done
+    # 保底清理
+    pkill -f "cloudflared" 2>/dev/null
 }
 
 _add_argo_vless_ws() {
@@ -391,18 +430,12 @@ _add_argo_vless_ws() {
     # 安装 cloudflared
     _install_cloudflared || return 1
     
-    # 输入端口
-    read -p "请输入本地监听端口 (回车随机): " port
-    if [ -z "$port" ]; then
-        port=$(shuf -i 10000-60000 -n 1)
-        _info "已分配随机端口: ${port}"
-    fi
-    
-    # 检查端口冲突
-    if jq -e ".inbounds[] | select(.listen_port == $port)" "$CONFIG_FILE" >/dev/null 2>&1; then
-        _error "端口 $port 已被占用！"
-        return 1
-    fi
+    # 自动分配内部端口 (无需用户输入，仅用于本地通信)
+    local port=$(shuf -i 10000-60000 -n 1)
+    while jq -e ".inbounds[] | select(.listen_port == $port)" "$CONFIG_FILE" >/dev/null 2>&1; do
+         port=$(shuf -i 10000-60000 -n 1)
+    done
+    _info "已自动分配内部监听端口: ${port}"
     
     # 输入 WebSocket 路径
     read -p "请输入 WebSocket 路径 (回车随机生成): " ws_path
@@ -414,7 +447,63 @@ _add_argo_vless_ws() {
     fi
     
     # 自定义名称
-    local default_name="VLESS-Argo-${port}"
+    # (节点名称输入已移动到模式选择之后)
+    
+    # --- 模式选择 ---
+    echo ""
+    echo "请选择隧道模式:"
+    echo "  1. 临时隧道 (无需配置, 随机域名, 不稳定)"
+    echo "  2. 固定隧道 (需 Token, 自定义域名, 稳定持久)"
+    read -p "请选择 [1/2] (默认: 1): " tunnel_mode
+    tunnel_mode=${tunnel_mode:-1}
+    
+    local token=""
+    local tunnel_domain=""
+    local argo_type="temp"
+    
+    if [ "$tunnel_mode" == "2" ]; then
+        argo_type="fixed"
+        _info "您选择了 [固定隧道] 模式。"
+        echo ""
+        _info "请粘贴 Cloudflare Tunnel Token (支持直接粘贴安装命令):"
+        read -p "Token: " input_token
+        # 自动提取 Token
+        token=$(echo "$input_token" | grep -oE 'ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+' | head -1)
+        if [ -z "$token" ]; then
+             token=$(echo "$input_token" | grep -oE 'ey[A-Za-z0-9_-]{20,}' | head -1)
+        fi
+        if [ -z "$token" ]; then
+             token="$input_token"
+        fi
+        
+        if [ -z "$token" ]; then _error "Token 不能为空"; return 1; fi
+        _info "已识别 Token (前20位): ${token:0:20}..."
+        
+        echo ""
+        _info "请输入该 Tunnel 绑定的域名 (用于生成客户端配置):"
+        read -p "域名 (例如 tunnel.example.com): " input_domain
+        if [ -z "$input_domain" ]; then _error "域名不能为空"; return 1; fi
+        tunnel_domain="$input_domain"
+        
+        echo ""
+        _info "【重要提示】请务必去 Cloudflare Dashboard 配置该 Tunnel 的 Public Hostname:"
+        _info "  Public Hostname: ${tunnel_domain}"
+        _info "  Service: http://localhost:${port}"
+        echo ""
+        read -n 1 -s -r -p "确认配置无误后，按任意键继续..."
+        echo ""
+    else
+        _info "您选择了 [临时隧道] 模式。"
+    fi
+
+    # --- 节点名称输入 (移动至此) ---
+    local default_prefix="Argo-Temp"
+    if [ "$argo_type" == "fixed" ]; then
+        default_prefix="Argo-Fixed"
+    fi
+    local default_name="${default_prefix}-Vless-${port}"
+    
+    echo ""
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
     
@@ -447,16 +536,25 @@ _add_argo_vless_ws() {
     sleep 2
     
     # 启动 Argo 隧道
-    local tunnel_domain=$(_start_argo_tunnel "$port" "vless-ws")
-    
-    if [ -z "$tunnel_domain" ] || [ "$tunnel_domain" == "" ]; then
-        _error "隧道启动失败，正在回滚配置..."
-        _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
-        _manage_service "restart"
-        return 1
+    if [ "$argo_type" == "fixed" ]; then
+        if ! _start_argo_tunnel "$port" "vless-ws" "$token"; then
+             # 回滚
+             _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
+             _manage_service "restart"
+             return 1
+        fi
+    else
+        local real_domain=$(_start_argo_tunnel "$port" "vless-ws")
+        if [ -z "$real_domain" ] || [ "$real_domain" == "" ]; then
+            _error "隧道启动失败，正在回滚配置..."
+            _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
+            _manage_service "restart"
+            return 1
+        fi
+        tunnel_domain="$real_domain"
     fi
     
-    # 保存 Argo 元数据
+    # 保存 Argo 元数据 (增加 type 和 token 字段)
     local argo_meta=$(jq -n \
         --arg tag "$tag" \
         --arg name "$name" \
@@ -465,13 +563,15 @@ _add_argo_vless_ws() {
         --arg uuid "$uuid" \
         --arg path "$ws_path" \
         --arg protocol "vless-ws" \
+        --arg type "$argo_type" \
+        --arg token "$token" \
         --arg created "$(date '+%Y-%m-%d %H:%M:%S')" \
-        '{($tag): {name: $name, domain: $domain, local_port: ($port|tonumber), uuid: $uuid, path: $path, protocol: $protocol, created_at: $created}}')
+        '{($tag): {name: $name, domain: $domain, local_port: ($port|tonumber), uuid: $uuid, path: $path, protocol: $protocol, type: $type, token: $token, created_at: $created}}')
     
     if [ ! -f "$ARGO_METADATA_FILE" ]; then
         echo '{}' > "$ARGO_METADATA_FILE"
     fi
-    jq ". + $argo_meta" "$ARGO_METADATA_FILE" > "${ARGO_METADATA_FILE}.tmp" && mv "${ARGO_METADATA_FILE}.tmp" "$ARGO_METADATA_FILE"
+    _atomic_modify_json "$ARGO_METADATA_FILE" ". + $argo_meta"
     
     # 生成 Clash 配置
     local proxy_json=$(jq -n \
@@ -503,17 +603,23 @@ _add_argo_vless_ws() {
     local encoded_path=$(_url_encode "$ws_path")
     local share_link="vless://${uuid}@${tunnel_domain}:443?encryption=none&security=tls&type=ws&host=${tunnel_domain}&path=${encoded_path}&sni=${tunnel_domain}#$(_url_encode "$name")"
     
+    # 启用守护进程
+    _enable_argo_watchdog
+
     echo ""
     _success "VLESS-WS + Argo 节点创建成功!"
     echo "-------------------------------------------"
     echo -e "节点名称: ${GREEN}${name}${NC}"
+    echo -e "隧道类型: ${CYAN}${argo_type}${NC}"
     echo -e "隧道域名: ${CYAN}${tunnel_domain}${NC}"
     echo -e "本地端口: ${port}"
     echo "-------------------------------------------"
     echo -e "${YELLOW}分享链接:${NC}"
     echo "$share_link"
     echo "-------------------------------------------"
-    _warning "注意: 临时隧道每次重启域名会变化！"
+    if [ "$argo_type" == "temp" ]; then
+        _warning "注意: 临时隧道每次重启域名会变化！"
+    fi
 }
 
 _add_argo_trojan_ws() {
@@ -522,18 +628,12 @@ _add_argo_trojan_ws() {
     # 安装 cloudflared
     _install_cloudflared || return 1
     
-    # 输入端口
-    read -p "请输入本地监听端口 (回车随机): " port
-    if [ -z "$port" ]; then
-        port=$(shuf -i 10000-60000 -n 1)
-        _info "已分配随机端口: ${port}"
-    fi
-    
-    # 检查端口冲突
-    if jq -e ".inbounds[] | select(.listen_port == $port)" "$CONFIG_FILE" >/dev/null 2>&1; then
-        _error "端口 $port 已被占用！"
-        return 1
-    fi
+    # 自动分配内部端口 (无需用户输入，仅用于本地通信)
+    local port=$(shuf -i 10000-60000 -n 1)
+    while jq -e ".inbounds[] | select(.listen_port == $port)" "$CONFIG_FILE" >/dev/null 2>&1; do
+         port=$(shuf -i 10000-60000 -n 1)
+    done
+    _info "已自动分配内部监听端口: ${port}"
     
     # 输入 WebSocket 路径
     read -p "请输入 WebSocket 路径 (回车随机生成): " ws_path
@@ -552,7 +652,63 @@ _add_argo_trojan_ws() {
     fi
     
     # 自定义名称
-    local default_name="Trojan-Argo-${port}"
+    # (节点名称输入已移动到模式选择之后)
+    
+    # --- 模式选择 ---
+    echo ""
+    echo "请选择隧道模式:"
+    echo "  1. 临时隧道 (无需配置, 随机域名, 不稳定)"
+    echo "  2. 固定隧道 (需 Token, 自定义域名, 稳定持久)"
+    read -p "请选择 [1/2] (默认: 1): " tunnel_mode
+    tunnel_mode=${tunnel_mode:-1}
+    
+    local token=""
+    local tunnel_domain=""
+    local argo_type="temp"
+    
+    if [ "$tunnel_mode" == "2" ]; then
+        argo_type="fixed"
+        _info "您选择了 [固定隧道] 模式。"
+        echo ""
+        _info "请粘贴 Cloudflare Tunnel Token (支持直接粘贴安装命令):"
+        read -p "Token: " input_token
+        # 自动提取 Token
+        token=$(echo "$input_token" | grep -oE 'ey[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+' | head -1)
+        if [ -z "$token" ]; then
+             token=$(echo "$input_token" | grep -oE 'ey[A-Za-z0-9_-]{20,}' | head -1)
+        fi
+        if [ -z "$token" ]; then
+             token="$input_token"
+        fi
+        
+        if [ -z "$token" ]; then _error "Token 不能为空"; return 1; fi
+        _info "已识别 Token (前20位): ${token:0:20}..."
+        
+        echo ""
+        _info "请输入该 Tunnel 绑定的域名 (用于生成客户端配置):"
+        read -p "域名 (例如 tunnel.example.com): " input_domain
+        if [ -z "$input_domain" ]; then _error "域名不能为空"; return 1; fi
+        tunnel_domain="$input_domain"
+        
+        echo ""
+        _info "【重要提示】请务必去 Cloudflare Dashboard 配置该 Tunnel 的 Public Hostname:"
+        _info "  Public Hostname: ${tunnel_domain}"
+        _info "  Service: http://localhost:${port}"
+        echo ""
+        read -n 1 -s -r -p "确认配置无误后，按任意键继续..."
+        echo ""
+    else
+        _info "您选择了 [临时隧道] 模式。"
+    fi
+
+    # --- 节点名称输入 (移动至此) ---
+    local default_prefix="Argo-Temp"
+    if [ "$argo_type" == "fixed" ]; then
+        default_prefix="Argo-Fixed"
+    fi
+    local default_name="${default_prefix}-Trojan-${port}"
+    
+    echo ""
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
     
@@ -583,16 +739,26 @@ _add_argo_trojan_ws() {
     sleep 2
     
     # 启动 Argo 隧道
-    local tunnel_domain=$(_start_argo_tunnel "$port" "trojan-ws")
-    
-    if [ -z "$tunnel_domain" ] || [ "$tunnel_domain" == "" ]; then
-        _error "隧道启动失败，正在回滚配置..."
-        _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
-        _manage_service "restart"
-        return 1
+    if [ "$argo_type" == "fixed" ]; then
+        if ! _start_argo_tunnel "$port" "trojan-ws" "$token"; then
+             # 回滚
+             _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
+             _manage_service "restart"
+             return 1
+        fi
+    else
+        local real_domain=$(_start_argo_tunnel "$port" "trojan-ws")
+        
+        if [ -z "$real_domain" ] || [ "$real_domain" == "" ]; then
+            _error "隧道启动失败，正在回滚配置..."
+            _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
+            _manage_service "restart"
+            return 1
+        fi
+        tunnel_domain="$real_domain"
     fi
     
-    # 保存 Argo 元数据
+    # 保存 Argo 元数据 (增加 type 和 token)
     local argo_meta=$(jq -n \
         --arg tag "$tag" \
         --arg name "$name" \
@@ -601,13 +767,15 @@ _add_argo_trojan_ws() {
         --arg password "$password" \
         --arg path "$ws_path" \
         --arg protocol "trojan-ws" \
+        --arg type "$argo_type" \
+        --arg token "$token" \
         --arg created "$(date '+%Y-%m-%d %H:%M:%S')" \
-        '{($tag): {name: $name, domain: $domain, local_port: ($port|tonumber), password: $password, path: $path, protocol: $protocol, created_at: $created}}')
+        '{($tag): {name: $name, domain: $domain, local_port: ($port|tonumber), password: $password, path: $path, protocol: $protocol, type: $type, token: $token, created_at: $created}}')
     
     if [ ! -f "$ARGO_METADATA_FILE" ]; then
         echo '{}' > "$ARGO_METADATA_FILE"
     fi
-    jq ". + $argo_meta" "$ARGO_METADATA_FILE" > "${ARGO_METADATA_FILE}.tmp" && mv "${ARGO_METADATA_FILE}.tmp" "$ARGO_METADATA_FILE"
+    _atomic_modify_json "$ARGO_METADATA_FILE" ". + $argo_meta"
     
     # 生成 Clash 配置
     local proxy_json=$(jq -n \
@@ -639,85 +807,82 @@ _add_argo_trojan_ws() {
     local encoded_password=$(_url_encode "$password")
     local share_link="trojan://${encoded_password}@${tunnel_domain}:443?security=tls&type=ws&host=${tunnel_domain}&path=${encoded_path}&sni=${tunnel_domain}#$(_url_encode "$name")"
     
+    # 启用守护进程
+    _enable_argo_watchdog
+
     echo ""
     _success "Trojan-WS + Argo 节点创建成功!"
     echo "-------------------------------------------"
     echo -e "节点名称: ${GREEN}${name}${NC}"
+    echo -e "隧道类型: ${CYAN}${argo_type}${NC}"
     echo -e "隧道域名: ${CYAN}${tunnel_domain}${NC}"
     echo -e "本地端口: ${port}"
     echo "-------------------------------------------"
     echo -e "${YELLOW}分享链接:${NC}"
     echo "$share_link"
     echo "-------------------------------------------"
-    _warning "注意: 临时隧道每次重启域名会变化！"
+    if [ "$argo_type" == "temp" ]; then
+        _warning "注意: 临时隧道每次重启域名会变化！"
+    fi
 }
 
 _view_argo_nodes() {
     _info "--- Argo 隧道节点信息 ---"
     
-    if [ ! -f "$ARGO_METADATA_FILE" ]; then
+    if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE")" -eq 0 ]; then
         _warning "没有 Argo 隧道节点。"
         return
     fi
     
-    local count=$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null)
-    if [ -z "$count" ] || [ "$count" -eq 0 ]; then
-        _warning "没有 Argo 隧道节点。"
-        return
-    fi
-    
-    # 获取隧道状态
-    local running_domain=""
-    local tunnel_pid=""
-    if [ -f "$ARGO_PID_FILE" ]; then
-        tunnel_pid=$(cat "$ARGO_PID_FILE" 2>/dev/null)
-        if [ -n "$tunnel_pid" ] && kill -0 "$tunnel_pid" 2>/dev/null; then
-            _success "隧道状态: 运行中 (PID: ${tunnel_pid})"
-            # 从日志获取当前域名
-            if [ -f "$ARGO_LOG_FILE" ]; then
-                running_domain=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' "$ARGO_LOG_FILE" 2>/dev/null | tail -1 | sed 's|https://||')
-                if [ -n "$running_domain" ]; then
-                    echo -e "当前隧道域名: ${CYAN}${running_domain}${NC}"
-                fi
-            fi
-        else
-            _warning "隧道状态: 已停止"
-        fi
-    else
-        _warning "隧道状态: 已停止"
-    fi
-    
-    echo ""
     echo "==================================================="
-    
-    # 直接使用 jq 格式化输出，避免管道子 shell 问题
-    jq -r 'to_entries[] | "节点: \(.value.name)\n  协议: \(.value.protocol)\n  本地端口: \(.value.local_port)\n  保存的域名: \(.value.domain)\n  创建时间: \(.value.created_at)\n-------------------------------------------"' "$ARGO_METADATA_FILE"
-    
-    echo "==================================================="
-    
-    # 如果隧道正在运行，显示当前分享链接
-    if [ -n "$running_domain" ]; then
-        echo ""
-        _info "--- 当前可用的分享链接 ---"
+    # 遍历并显示
+    jq -r 'to_entries[] | "\(.value.name)|\(.value.type)|\(.value.protocol)|\(.value.local_port)|\(.value.domain)|\(.value.uuid // "")|\(.value.path // "")|\(.value.password // "")"' "$ARGO_METADATA_FILE" | \
+    while IFS='|' read -r name type protocol port domain uuid path password; do
+        echo -e "节点: ${GREEN}${name}${NC}"
+        echo -e "  协议: ${protocol}"
+        echo -e "  端口: ${port}"
         
-        local first_node=$(jq -r 'to_entries[0]' "$ARGO_METADATA_FILE")
-        local protocol=$(echo "$first_node" | jq -r '.value.protocol')
-        local path=$(echo "$first_node" | jq -r '.value.path')
-        local name=$(echo "$first_node" | jq -r '.value.name')
+        # 检查状态
+        local pid_file="/tmp/singbox_argo_${port}.pid"
+        local state="${RED}已停止${NC}"
+        local running_domain=""
         
-        if [ "$protocol" == "vless-ws" ]; then
-            local uuid=$(echo "$first_node" | jq -r '.value.uuid')
-            local encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
-            local encoded_name=$(printf '%s' "$name" | jq -sRr @uri)
-            echo -e "${YELLOW}vless://${uuid}@${running_domain}:443?encryption=none&security=tls&type=ws&host=${running_domain}&path=${encoded_path}&sni=${running_domain}#${encoded_name}${NC}"
-        elif [ "$protocol" == "trojan-ws" ]; then
-            local password=$(echo "$first_node" | jq -r '.value.password')
-            local encoded_path=$(printf '%s' "$path" | jq -sRr @uri)
-            local encoded_name=$(printf '%s' "$name" | jq -sRr @uri)
-            local encoded_password=$(printf '%s' "$password" | jq -sRr @uri)
-            echo -e "${YELLOW}trojan://${encoded_password}@${running_domain}:443?security=tls&type=ws&host=${running_domain}&path=${encoded_path}&sni=${running_domain}#${encoded_name}${NC}"
+        if [ -f "$pid_file" ] && kill -0 $(cat "$pid_file") 2>/dev/null; then
+             state="${GREEN}运行中${NC} (PID: $(cat $pid_file))"
+             # 如果是临时的，尝试从 log 读最新域名
+             if [ "$type" == "temp" ] || [ -z "$domain" ] || [ "$domain" == "null" ]; then
+                  local log_file="/tmp/singbox_argo_${port}.log"
+                  local temp_domain=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' "$log_file" 2>/dev/null | tail -1 | sed 's|https://||')
+                   [ -n "$temp_domain" ] && domain="$temp_domain"
+             fi
+             running_domain="$domain"
         fi
-    fi
+        
+        echo -e "  状态: ${state}"
+        echo -e "  域名: ${CYAN}${domain}${NC}"
+
+        # --- 生成并显示链接 ---
+        if [ -n "$domain" ] && [ "$domain" != "null" ]; then
+             local safe_name=$(_url_encode "$name")
+             local safe_path=$(_url_encode "$path")
+             local link=""
+             
+             if [[ "$protocol" == "vless-ws" ]]; then
+                 link="vless://${uuid}@${domain}:443?encryption=none&security=tls&type=ws&host=${domain}&path=${safe_path}&sni=${domain}#${safe_name}"
+             elif [[ "$protocol" == "trojan-ws" ]]; then
+                 local safe_pw=$(_url_encode "$password")
+                 link="trojan://${safe_pw}@${domain}:443?security=tls&type=ws&host=${domain}&path=${safe_path}&sni=${domain}#${safe_name}"
+             fi
+
+             if [ -n "$link" ]; then
+                  echo -e "  ${YELLOW}链接:${NC} $link"
+             fi
+        fi
+        echo "-------------------------------------------"
+    done
+    
+    echo -e "${YELLOW}提示: 请使用 [5] 重启隧道 来刷新所有节点状态或获取新临时域名。${NC}"
+    echo "==================================================="
 }
 
 _delete_argo_node() {
@@ -728,75 +893,260 @@ _delete_argo_node() {
     
     _info "--- 删除 Argo 隧道节点 ---"
     
+    # 读取所有节点到数组
     local i=1
-    local tags=()
+    local keys=()
+    local names=()
+    local ports=()
     
-    jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.protocol)|\(.value.local_port)"' "$ARGO_METADATA_FILE" | while IFS='|' read -r tag name protocol port; do
-        echo -e " ${CYAN}$i)${NC} ${name} (${protocol}) @ ${port}"
-        tags+=("$tag")
+    # 必须使用 while read 处理 process substitution 避免子 shell 问题
+    while IFS='|' read -r key name port; do
+        keys+=("$key")
+        names+=("$name")
+        ports+=("$port")
+        echo -e " ${CYAN}$i)${NC} ${name} (端口: $port)"
         ((i++))
-    done
+    done < <(jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.local_port)"' "$ARGO_METADATA_FILE")
     
+    if [ ${#keys[@]} -eq 0 ]; then
+         _warning "读取元数据失败。"
+         return
+    fi
+
     echo " 0) 返回"
     read -p "请选择要删除的节点: " choice
     
-    [[ ! "$choice" =~ ^[1-9][0-9]*$ ]] && return
-    
-    local selected_tag=$(jq -r "to_entries[$((choice-1))].key" "$ARGO_METADATA_FILE")
-    local selected_name=$(jq -r ".\"$selected_tag\".name" "$ARGO_METADATA_FILE")
-    
-    if [ -z "$selected_tag" ] || [ "$selected_tag" == "null" ]; then
-        _error "无效选择"
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt "${#keys[@]}" ]; then
+        _error "无效输入"
         return
     fi
     
-    read -p "$(echo -e ${YELLOW}"确定删除节点 ${selected_name}? (y/N): "${NC})" confirm
-    [[ "$confirm" != "y" && "$confirm" != "Y" ]] && return
+    if [ "$choice" -eq 0 ]; then return; fi
     
-    # 停止隧道
-    _stop_argo_tunnel
+    local idx=$((choice - 1))
+    local selected_key="${keys[$idx]}"
+    local selected_name="${names[$idx]}"
+    local selected_port="${ports[$idx]}"
     
-    # 删除 sing-box 配置
-    _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$selected_tag\"))"
+    _info "正在删除节点: ${selected_name} (端口: ${selected_port})..."
     
-    # 删除 Argo 元数据
-    jq "del(.\"$selected_tag\")" "$ARGO_METADATA_FILE" > "${ARGO_METADATA_FILE}.tmp" && mv "${ARGO_METADATA_FILE}.tmp" "$ARGO_METADATA_FILE"
+    # 1. 停止该节点的隧道进程
+    _stop_argo_tunnel "$selected_port"
     
-    # 删除 Clash 配置
+    # 2. 从 sing-box 配置文件中移除 inbound
+    _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$selected_key\"))"
+    
+    # 3. 删除 Argo 元数据
+    jq "del(.\"$selected_key\")" "$ARGO_METADATA_FILE" > "${ARGO_METADATA_FILE}.tmp" && mv "${ARGO_METADATA_FILE}.tmp" "$ARGO_METADATA_FILE"
+    
+    # 4. 删除 Clash 配置
     _remove_node_from_yaml "$selected_name"
     
+    # 5. 检查是否还有节点，如果没有则禁用守护进程
+    if [ "$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null)" -eq 0 ]; then
+        _disable_argo_watchdog
+    fi
+
+    # 6. 重启 sing-box
     _manage_service "restart"
     
     _success "节点 ${selected_name} 已删除！"
 }
 
-_restart_argo_tunnel_menu() {
-    _info "重启 Argo 隧道将获取新的临时域名..."
+_stop_argo_menu() {
+    _info "--- 停止 Argo 隧道进程 (保留配置) ---"
+    # 复用选择逻辑
+    local i=1
+    local keys=()
+    local names=()
+    local ports=()
     
-    if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE")" -eq 0 ]; then
-        _warning "没有 Argo 隧道节点。"
+    while IFS='|' read -r key name port; do
+        keys+=("$key")
+        names+=("$name")
+        ports+=("$port")
+        echo -e " ${CYAN}$i)${NC} ${name} (端口: $port)"
+        ((i++))
+    done < <(jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.local_port)"' "$ARGO_METADATA_FILE")
+    
+    echo " a) 停止所有运行中的隧道"
+    echo " 0) 返回"
+    read -p "请选择: " choice
+    
+    if [ "$choice" == "a" ]; then
+        _stop_all_argo_tunnels
+        _success "所有隧道已停止指令发送。"
         return
     fi
     
-    # 获取第一个节点的端口
-    local port=$(jq -r 'to_entries[0].value.local_port' "$ARGO_METADATA_FILE")
-    local protocol=$(jq -r 'to_entries[0].value.protocol' "$ARGO_METADATA_FILE")
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [ "$choice" -lt 0 ] || [ "$choice" -gt "${#keys[@]}" ]; then
+        _error "无效输入"
+        return
+    fi
+    if [ "$choice" -eq 0 ]; then return; fi
     
-    # 停止当前隧道
-    _stop_argo_tunnel
-    sleep 2
+    local idx=$((choice - 1))
+    local selected_port="${ports[$idx]}"
     
-    # 重新启动隧道
-    local new_domain=$(_start_argo_tunnel "$port" "$protocol")
+    _stop_argo_tunnel "$selected_port"
+}
+
+_restart_argo_tunnel_menu() {
+    _info "--- 重启 Argo 隧道 ---"
     
-    if [ -n "$new_domain" ]; then
-        _success "新隧道域名: ${new_domain}"
-        _warning "请更新客户端的服务器地址为新域名！"
-        
-        # 更新元数据中的域名
-        jq "to_entries[0].value.domain = \"$new_domain\"" "$ARGO_METADATA_FILE" > "${ARGO_METADATA_FILE}.tmp" && mv "${ARGO_METADATA_FILE}.tmp" "$ARGO_METADATA_FILE"
+     if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE")" -eq 0 ]; then
+        _warning "没有 Argo 隧道节点。"
+        return
+    fi
+
+    # 选择逻辑
+    local i=1
+    local keys=()
+    local names=()
+    local ports=()
+    local protocols=()
+    local types=()
+    local tokens=()
+    
+    while IFS='|' read -r key name port proto type token; do
+        keys+=("$key")
+        names+=("$name")
+        ports+=("$port")
+        protocols+=("$proto")
+        types+=("$type")
+        tokens+=("$token")
+        echo -e " ${CYAN}$i)${NC} ${name} (端口: $port)"
+        ((i++))
+    done < <(jq -r 'to_entries[] | "\(.key)|\(.value.name)|\(.value.local_port)|\(.value.protocol)|\(.value.type)|\(.value.token)"' "$ARGO_METADATA_FILE")
+    
+    echo " a) 重启所有节点"
+    echo " 0) 返回"
+    read -p "请选择: " choice
+    
+    local idx_list=()
+    if [ "$choice" == "a" ]; then
+        # 生成所有索引
+        for ((j=0; j<${#keys[@]}; j++)); do idx_list+=($j); done
+    elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -gt 0 ] && [ "$choice" -le "${#keys[@]}" ]; then
+        idx_list+=($((choice - 1)))
     else
-        _error "隧道重启失败"
+        if [ "$choice" -ne 0 ]; then _error "无效输入"; fi
+        return
+    fi
+    
+    # 执行重启循环
+    for idx in "${idx_list[@]}"; do
+        local key="${keys[$idx]}" # tag
+        local name="${names[$idx]}"
+        local port="${ports[$idx]}"
+        local proto="${protocols[$idx]}"
+        local type="${types[$idx]}"
+        local token="${tokens[$idx]}"
+        
+        _info "正在重启: $name (端口: $port)..."
+        
+        # 停止
+        _stop_argo_tunnel "$port"
+        sleep 1
+        
+        # 启动
+        local new_domain=""
+        if [ "$type" == "fixed" ]; then
+            if _start_argo_tunnel "$port" "$proto" "$token"; then
+                 new_domain=$(jq -r ".\"$key\".domain" "$ARGO_METADATA_FILE")
+            else
+                 _error "固定隧道重启失败: $name"
+            fi
+        else
+            new_domain=$(_start_argo_tunnel "$port" "$proto")
+            if [ -n "$new_domain" ]; then
+                 # 更新元数据域
+                 jq ".\"$key\".domain = \"$new_domain\"" "$ARGO_METADATA_FILE" > "${ARGO_METADATA_FILE}.tmp" && mv "${ARGO_METADATA_FILE}.tmp" "$ARGO_METADATA_FILE"
+                 _success "更新临时域名: $new_domain"
+            else
+                 _error "临时隧道重启失败: $name"
+            fi
+        fi
+    done
+    _success "操作完成。"
+}
+
+# --- Argo 守护进程逻辑 ---
+
+_argo_keepalive() {
+    # 如果元数据文件不存在或为空，不需要守护
+    if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null)" -eq 0 ]; then
+        return
+    fi
+
+    # 遍历所有节点
+    local i=0
+    # keys[] 可能会包含空格，虽然 tag 一般不含空格，但为了健壮性...
+    local tags=$(jq -r 'keys[]' "$ARGO_METADATA_FILE")
+    
+    for tag in $tags; do
+        local port=$(jq -r ".\"$tag\".local_port" "$ARGO_METADATA_FILE")
+        local type=$(jq -r ".\"$tag\".type" "$ARGO_METADATA_FILE")
+        local token=$(jq -r ".\"$tag\".token // empty" "$ARGO_METADATA_FILE")
+        local protocol=$(jq -r ".\"$tag\".protocol // \"vless-ws\"" "$ARGO_METADATA_FILE")
+        
+        local pid_file="/tmp/singbox_argo_${port}.pid"
+        local is_running=false
+        
+        if [ -f "$pid_file" ]; then
+            local pid=$(cat "$pid_file" 2>/dev/null)
+            if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                is_running=true
+            fi
+        fi
+        
+        if [ "$is_running" == "false" ]; then
+            # 尝试重启
+            logger "sing-box-watchdog: Detected dead tunnel for $tag (Port: $port). Restarting..."
+            
+            if [ "$type" == "fixed" ] && [ -n "$token" ]; then
+                 if _start_argo_tunnel "$port" "$type" "$token"; then
+                     logger "sing-box-watchdog: Fixed tunnel $tag restarted successfully."
+                 else
+                     logger "sing-box-watchdog: Failed to restart fixed tunnel $tag."
+                 fi
+            else
+                 # 临时隧道
+                 local new_domain=$(_start_argo_tunnel "$port" "temp")
+                 if [ -n "$new_domain" ]; then
+                      # 更新元数据
+                      _atomic_modify_json "$ARGO_METADATA_FILE" ".\"$tag\".domain = \"$new_domain\""
+                      logger "sing-box-watchdog: Temp tunnel $tag restarted with new domain: $new_domain"
+                 else
+                      logger "sing-box-watchdog: Failed to restart temp tunnel $tag."
+                 fi
+            fi
+        fi
+    done
+}
+
+_enable_argo_watchdog() {
+    # 检查 crontab 是否已有任务
+    local job="* * * * * bash ${SELF_SCRIPT_PATH} keepalive >/dev/null 2>&1"
+    
+    if ! crontab -l 2>/dev/null | grep -Fq "$job"; then
+        _info "正在添加后台守护进程 (Watchdog)..."
+        (crontab -l 2>/dev/null; echo "$job") | crontab -
+        if [ $? -eq 0 ]; then
+            _success "守护进程已启用！(每分钟检查并自动修复失效隧道)"
+        else
+            _warning "添加 Crontab 失败，守护进程未生效。"
+        fi
+    fi
+}
+
+_disable_argo_watchdog() {
+    local job="bash ${SELF_SCRIPT_PATH} keepalive"
+    
+    if crontab -l 2>/dev/null | grep -Fq "$job"; then
+        _info "正在移除后台守护进程..."
+        crontab -l 2>/dev/null | grep -Fv "$job" | crontab -
+        _success "守护进程已移除。"
     fi
 }
 
@@ -806,8 +1156,7 @@ _uninstall_argo() {
     echo ""
     echo "即将删除的内容："
     echo -e "  ${RED}-${NC} cloudflared 程序: ${CLOUDFLARED_BIN}"
-    echo -e "  ${RED}-${NC} Argo 日志文件: ${ARGO_LOG_FILE}"
-    echo -e "  ${RED}-${NC} Argo 元数据文件: ${ARGO_METADATA_FILE}"
+    echo -e "  ${RED}-${NC} 所有 Argo 日志文件和元数据文件"
     
     if [ -f "$ARGO_METADATA_FILE" ]; then
         local argo_count=$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null || echo "0")
@@ -824,27 +1173,44 @@ _uninstall_argo() {
     
     _info "正在卸载 Argo 服务..."
     
-    # 1. 停止隧道进程
-    _stop_argo_tunnel
+    # 1. 停止所有隧道进程
+    _stop_all_argo_tunnels
     
     # 2. 删除 sing-box 中的 Argo inbound 配置
     if [ -f "$ARGO_METADATA_FILE" ]; then
-        jq -r 'keys[]' "$ARGO_METADATA_FILE" 2>/dev/null | while read -r tag; do
-            if [ -n "$tag" ]; then
+         # 同样需要遍历删除逻辑，这里简化为遍历 metadata 删除
+         # 为防止 jq 读写竞争，我们先收集所有 tags
+        local tags=$(jq -r 'keys[]' "$ARGO_METADATA_FILE" 2>/dev/null)
+        for tag in $tags; do
+             if [ -n "$tag" ]; then
                 _info "正在删除节点配置: ${tag}"
-                jq "del(.inbounds[] | select(.tag == \"$tag\"))" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+                _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
                 
-                # 删除 Clash 配置
                 local node_name=$(jq -r ".\"$tag\".name" "$ARGO_METADATA_FILE" 2>/dev/null)
                 if [ -n "$node_name" ] && [ "$node_name" != "null" ]; then
                     _remove_node_from_yaml "$node_name"
                 fi
-            fi
+             fi
         done
     fi
     
-    # 3. 删除 cloudflared 和相关文件
-    rm -f "${CLOUDFLARED_BIN}" "${ARGO_PID_FILE}" "${ARGO_LOG_FILE}" "${ARGO_METADATA_FILE}"
+    # 3. 移除守护进程
+    _disable_argo_watchdog
+
+    # 4. 删除 cloudflared 和相关文件及服务
+    _info "正在清理 cloudflared 文件及服务..."
+    
+    if command -v systemctl &>/dev/null; then
+        systemctl stop cloudflared >/dev/null 2>&1
+        systemctl disable cloudflared >/dev/null 2>&1
+    fi
+    
+    pkill -f "cloudflared" 2>/dev/null
+    
+    # 删除所有 PID/LOG 文件
+    rm -f /tmp/singbox_argo_*.pid /tmp/singbox_argo_*.log
+    rm -f "${CLOUDFLARED_BIN}" "${ARGO_METADATA_FILE}"
+    rm -rf "/etc/cloudflared"
     
     # 4. 重启 sing-box
     _manage_service "restart"
@@ -891,10 +1257,10 @@ _argo_menu() {
             3) _view_argo_nodes ;;
             4) _delete_argo_node ;;
             5) _restart_argo_tunnel_menu ;;
-            6) _stop_argo_tunnel ;;
+            6) _stop_argo_menu ;;
             7) _uninstall_argo ;;
             0) return ;;
-            *) _error "无效输入" ;;
+            *) _error "无效选项，请重新输入。" ;;
         esac
         
         echo ""
@@ -1128,9 +1494,16 @@ _uninstall() {
     fi
     
     # 清理 Argo Tunnel (cloudflared) 相关文件
-    if [ -f "${CLOUDFLARED_BIN}" ] || [ -f "${ARGO_METADATA_FILE}" ]; then
+    if [ -f "${CLOUDFLARED_BIN}" ] || [ -f "${ARGO_METADATA_FILE}" ] || [ -d "/etc/cloudflared" ]; then
         _info "正在清理 Argo 隧道相关文件..."
-        # 停止隧道进程
+        
+        # [新增] 尝试停止并禁用可能存在的 cloudflared 系统服务
+        if command -v systemctl &>/dev/null; then
+            systemctl stop cloudflared >/dev/null 2>&1
+            systemctl disable cloudflared >/dev/null 2>&1
+        fi
+        
+        # 停止脚本启动的隧道进程
         if [ -f "${ARGO_PID_FILE}" ]; then
             local argo_pid=$(cat "${ARGO_PID_FILE}" 2>/dev/null)
             if [ -n "$argo_pid" ] && kill -0 "$argo_pid" 2>/dev/null; then
@@ -1138,10 +1511,16 @@ _uninstall() {
                 _info "已停止 Argo 隧道进程"
             fi
         fi
-        pkill -f "cloudflared tunnel" 2>/dev/null
-        # 删除 cloudflared 二进制和相关文件
+        pkill -f "cloudflared" 2>/dev/null
+        
+        # 删除 cloudflared 二进制、相关文件和配置目录
         rm -f "${CLOUDFLARED_BIN}" "${ARGO_PID_FILE}" "${ARGO_LOG_FILE}" "${ARGO_METADATA_FILE}"
-        _success "Argo 隧道相关文件已清理"
+        rm -rf "/etc/cloudflared"
+        
+        # 如果是通过包管理器安装的，尝试卸载 (可选，防止残留)
+        # if command -v apt-get &>/dev/null; then apt-get remove -y cloudflared >/dev/null 2>&1; fi
+        
+        _success "Argo 隧道相关文件及服务已清理"
     fi
 
     if [ "$keep_singbox_binary" = false ]; then
@@ -4365,6 +4744,10 @@ while [[ $# -gt 0 ]]; do
         -q|--quick-deploy)
             QUICK_DEPLOY_MODE=true
             shift
+            ;;
+        keepalive)
+            _argo_keepalive
+            exit 0
             ;;
         *)
             shift
