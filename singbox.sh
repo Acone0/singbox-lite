@@ -1074,6 +1074,27 @@ _restart_argo_tunnel_menu() {
 # --- Argo 守护进程逻辑 ---
 
 _argo_keepalive() {
+    # --- 性能优化: 互斥锁 ---
+    local lock_file="/tmp/singbox_keepalive.lock"
+    if [ -f "$lock_file" ]; then
+        local pid=$(cat "$lock_file")
+        if kill -0 "$pid" 2>/dev/null; then
+            # 进程仍在运行，跳过本次执行
+            return
+        fi
+    fi
+    echo "$$" > "$lock_file"
+    # 确保退出时删除锁
+    trap 'rm -f "$lock_file"' RETURN EXIT
+
+    # --- 性能优化: 日志轮转 (10MB) ---
+    local max_size=$((10 * 1024 * 1024))
+    for log in "$LOG_FILE" "$ARGO_LOG_FILE"; do
+        if [ -f "$log" ] && [ $(stat -c%s "$log" 2>/dev/null || echo 0) -ge $max_size ]; then
+            tail -n 1000 "$log" > "${log}.tmp" && mv "${log}.tmp" "$log"
+        fi
+    done
+
     # 如果元数据文件不存在或为空，不需要守护
     if [ ! -f "$ARGO_METADATA_FILE" ] || [ "$(jq 'length' "$ARGO_METADATA_FILE" 2>/dev/null)" -eq 0 ]; then
         return
