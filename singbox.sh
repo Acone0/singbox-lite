@@ -30,7 +30,7 @@ INIT_SYSTEM="" # 将存储 'systemd', 'openrc' 或 'direct'
 SERVICE_FILE="" # 将根据 INIT_SYSTEM 设置
 
 # 脚本元数据
-SCRIPT_VERSION="8.0" 
+SCRIPT_VERSION="9.0" 
 SCRIPT_UPDATE_URL="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh" 
 
 # 全局状态变量
@@ -1292,15 +1292,27 @@ _argo_menu() {
 # --- 服务与配置管理 ---
 
 _create_systemd_service() {
+    # 自动计算 GOMEMLIMIT (目标 95%，但至少保留 40MB 给系统)
+    local total_mem_mb=$(free -m | awk '/^Mem:/{print $2}')
+    local mem_limit_mb=$((total_mem_mb * 95 / 100))
+    local reserved_mb=$((total_mem_mb - mem_limit_mb))
+    
+    if [ "$reserved_mb" -lt 40 ]; then
+        mem_limit_mb=$((total_mem_mb - 40))
+    fi
+    
+    if [ "$mem_limit_mb" -lt 10 ]; then mem_limit_mb=10; fi # 极端情况保底
+    
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=sing-box service
 Documentation=https://sing-box.sagernet.org
 After=network.target nss-lookup.target
 [Service]
+Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
 ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json
 Restart=on-failure
-RestartSec=10s
+RestartSec=3s
 LimitNOFILE=infinity
 [Install]
 WantedBy=multi-user.target
@@ -1310,6 +1322,17 @@ EOF
 _create_openrc_service() {
     # 确保日志文件存在
     touch "${LOG_FILE}"
+
+    # 自动计算 GOMEMLIMIT (目标 95%，但至少保留 40MB 给系统)
+    local total_mem_mb=$(free -m | awk '/^Mem:/{print $2}')
+    local mem_limit_mb=$((total_mem_mb * 95 / 100))
+    local reserved_mb=$((total_mem_mb - mem_limit_mb))
+    
+    if [ "$reserved_mb" -lt 40 ]; then
+        mem_limit_mb=$((total_mem_mb - 40))
+    fi
+    
+    if [ "$mem_limit_mb" -lt 10 ]; then mem_limit_mb=10; fi
     
     cat > "$SERVICE_FILE" <<EOF
 #!/sbin/openrc-run
@@ -1317,13 +1340,24 @@ _create_openrc_service() {
 description="sing-box service"
 command="${SINGBOX_BIN}"
 command_args="run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json"
-command_background=true
+# 使用 supervise-daemon 实现守护和重启
+supervisor="supervise-daemon"
+respawn_delay=3
+respawn_max=0
+
 pidfile="${PID_FILE}"
-start_stop_daemon_args="--stdout ${LOG_FILE} --stderr ${LOG_FILE}"
+# supervise-daemon 自动将 stdout/stderr 重定向功能需要 openrc 版本支持
+# 如果不支持，日志可能不会输出到文件，但服务能正常运行
+output_log="${LOG_FILE}"
+error_log="${LOG_FILE}"
 
 depend() {
     need net
     after firewall
+}
+
+start_pre() {
+    export GOMEMLIMIT="${mem_limit_mb}MiB"
 }
 EOF
     chmod +x "$SERVICE_FILE"
@@ -2228,15 +2262,9 @@ _add_anytls() {
             "listen_port": ($p|tonumber),
             "users": [{"name": "default", "password": $pw}],
             "padding_scheme": [
-                "stop=8",
-                "0=30-30",
-                "1=100-400",
-                "2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000",
-                "3=9-9,500-1000",
-                "4=500-1000",
-                "5=500-1000",
-                "6=500-1000",
-                "7=500-1000"
+                "stop=2",
+                "0=100-200",
+                "1=100-200"
             ],
             "tls": {
                 "enabled": true,
@@ -2368,9 +2396,10 @@ _add_hysteria2() {
     _generate_self_signed_cert "$server_name" "$cert_path" "$key_path" || return 1
     
     read -p "请输入密码 (默认随机): " password; password=${password:-$(${SINGBOX_BIN} generate rand --hex 16)}
-    # 服务端配置不限速，仅询问用于生成分享链接（默认给高值）
-    read -p "请输入客户端期望上传速度 (默认 1000 Mbps): " up_speed; up_speed=${up_speed:-"1000 Mbps"}
-    read -p "请输入客户端期望下载速度 (默认 1000 Mbps): " down_speed; down_speed=${down_speed:-"1000 Mbps"}
+    # 服务端配置不限速，客户端链接直接给万兆 (10000 Mbps) 以适配高性能环境
+    _info "正在自动配置带宽限制: 10Gbps模式..."
+    local up_speed="10000 Mbps"
+    local down_speed="10000 Mbps"
     
     local obfs_password=""
     read -p "是否开启 QUIC 流量混淆 (salamander)? (y/N): " choice
