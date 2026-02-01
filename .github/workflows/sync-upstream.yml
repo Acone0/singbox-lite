@@ -30,20 +30,35 @@ jobs:
       - name: Sync and check changes
         id: sync
         run: |
-          git checkout upstream/main -- singbox.sh
-          chmod +x singbox.sh
-          
-          if git diff --quiet HEAD singbox.sh; then
-            echo "has_changes=false" >> $GITHUB_OUTPUT
-            echo "✅ singbox.sh 无变化"
+          # 检查文件是否存在于上游
+          if git cat-file -e upstream/main:singbox.sh 2>/dev/null; then
+            git checkout upstream/main -- singbox.sh
+            chmod +x singbox.sh
+            
+            if git diff --quiet HEAD singbox.sh; then
+              echo "has_changes=false" >> $GITHUB_OUTPUT
+              echo "✅ singbox.sh 无变化"
+            else
+              echo "has_changes=true" >> $GITHUB_OUTPUT
+              echo "🔄 singbox.sh 已更新"
+              # 显示变更详情
+              echo "📝 变更内容："
+              git diff --stat HEAD singbox.sh
+            fi
           else
-            echo "has_changes=true" >> $GITHUB_OUTPUT
-            echo "🔄 singbox.sh 已更新"
+            echo "❌ 上游仓库中不存在 singbox.sh"
+            exit 1
           fi
 
       - name: Commit and push
         if: steps.sync.outputs.has_changes == 'true'
         run: |
           git add singbox.sh
-          git commit -m "🔄 同步上游 singbox.sh ($(date -u '+%Y-%m-%d'))"
+          git commit -m "🔄 sync: update singbox.sh from upstream ($(date -u '+%Y-%m-%d %H:%M:%S UTC'))"
           git push
+
+      - name: Push notification (optional)
+        if: steps.sync.outputs.has_changes == 'true'
+        run: |
+          echo "✅ 同步成功！"
+          echo "📅 同步时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
