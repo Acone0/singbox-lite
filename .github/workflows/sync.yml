@@ -1,0 +1,147 @@
+name: Sync Upstream Repository
+
+on:
+  schedule:
+    - cron: '0 */3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Backup workflows and custom files
+        run: |
+          echo "💾 备份工作流和自定义文件..."
+          mkdir -p /tmp/backup
+          
+          # 备份整个 .github 目录
+          if [ -d ".github" ]; then
+            cp -r .github /tmp/backup/
+            echo "✅ 已备份 .github/"
+            ls -la /tmp/backup/.github/workflows/ || true
+          fi
+          
+          # 备份其他自定义文件
+          PROTECTED_FILES=(
+            "README.md"
+            ".gitignore"
+          )
+          
+          for file in "${PROTECTED_FILES[@]}"; do
+            if [ -f "$file" ]; then
+              cp "$file" "/tmp/backup/"
+              echo "✅ 已备份: $file"
+            fi
+          done
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream https://github.com/0xdabiaoge/singbox-lite.git 2>/dev/null || true
+          git fetch upstream main
+
+      - name: Sync from upstream
+        run: |
+          echo "🔄 同步上游仓库所有内容..."
+          git reset --hard upstream/main
+          echo "✅ 已重置到上游版本"
+
+      - name: Restore workflows and custom files
+        run: |
+          echo "♻️ 恢复工作流和自定义文件..."
+          
+          # 恢复 .github 目录
+          if [ -d "/tmp/backup/.github" ]; then
+            rm -rf .github
+            cp -r /tmp/backup/.github .
+            echo "✅ 已恢复 .github/"
+            echo "📂 工作流文件列表:"
+            ls -la .github/workflows/ || true
+          fi
+          
+          # 恢复其他自定义文件
+          PROTECTED_FILES=(
+            "README.md"
+            ".gitignore"
+          )
+          
+          for file in "${PROTECTED_FILES[@]}"; do
+            if [ -f "/tmp/backup/$file" ]; then
+              cp "/tmp/backup/$file" .
+              echo "✅ 已恢复: $file"
+            fi
+          done
+          
+          echo ""
+          echo "📋 当前目录内容:"
+          ls -la
+
+      - name: Commit and push
+        run: |
+          echo "📝 准备提交..."
+          
+          # 明确添加 .github 目录和所有文件
+          git add -A
+          git add .github -f
+          
+          echo "📊 Git 状态:"
+          git status
+          
+          # 检查是否有 staged changes
+          if git diff --cached --quiet; then
+            echo "ℹ️ 无变化，跳过提交"
+          else
+            echo "✅ 检测到变化，准备提交..."
+            
+            git commit -m "🔄 sync: update from upstream (保护工作流)
+            
+            - 同步上游所有内容
+            - 保留 .github/workflows/
+            - 保留自定义文件
+            
+            Sync time: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            
+            echo "🚀 推送到远程..."
+            git push origin $(git branch --show-current)
+            
+            echo "✅ 同步成功！"
+          fi
+
+      - name: Verify workflow exists
+        if: always()
+        run: |
+          echo "🔍 验证工作流文件..."
+          if [ -d ".github/workflows" ]; then
+            echo "✅ .github/workflows/ 目录存在"
+            echo "📂 工作流文件:"
+            ls -la .github/workflows/
+          else
+            echo "❌ 警告: .github/workflows/ 目录不存在！"
+          fi
+
+      - name: Sync summary
+        if: always()
+        run: |
+          echo "================================"
+          echo "📊 同步任务摘要"
+          echo "================================"
+          echo "🕒 执行时间: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+          echo "🔗 上游仓库: https://github.com/0xdabiaoge/singbox-lite"
+          echo "📝 同步策略: 完整同步"
+          echo "🛡️ 受保护内容:"
+          echo "   - .github/workflows/ (工作流文件)"
+          echo "   - README.md"
+          echo "   - .gitignore"
+          echo "================================"
