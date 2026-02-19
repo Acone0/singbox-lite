@@ -1,30 +1,21 @@
 #!/bin/bash
 
-# 引入工具库 (Self-Initialization Logic)
+# 核心环境定义
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
 
-if [ -f "$SCRIPT_DIR/utils.sh" ]; then
-    source "$SCRIPT_DIR/utils.sh"
-elif [ -f "${SINGBOX_DIR}/utils.sh" ]; then
-    source "${SINGBOX_DIR}/utils.sh"
-else
-    if command -v curl &>/dev/null; then
-        curl -LfSs "$GITHUB_RAW_BASE/utils.sh" -o "$SCRIPT_DIR/utils.sh"
-    elif command -v wget &>/dev/null; then
-        wget -qO "$SCRIPT_DIR/utils.sh" "$GITHUB_RAW_BASE/utils.sh"
-    fi
-    [ -f "$SCRIPT_DIR/utils.sh" ] && chmod +x "$SCRIPT_DIR/utils.sh"
-    [ -f "$SCRIPT_DIR/utils.sh" ] && source "$SCRIPT_DIR/utils.sh"
-fi
+# [整合方案] 解析器核心解码函数 (独立实现，不依赖外部)
+_url_decode() {
+    local data="${1//+/ }"
+    printf '%b' "${data//%/\\x}"
+}
 
 if ! command -v jq &>/dev/null; then
     echo '{"error": "缺少 jq 依赖"}'
     exit 1
 fi
 
-# 解析器使用的 URL 解码统一由 utils.sh 提供
+# 解析器使用的 URL 解码统一由主脚本或独立实现提供
 _decode() { _url_decode "$1"; }
 
 _get_param() {
@@ -80,7 +71,11 @@ _parse_vless() {
 # 解析 VMess
 _parse_vmess() {
     local link="${1#vmess://}"
-    local decoded=$(echo -n "$link" | base64 -d 2>/dev/null)
+    # 处理 URL-safe Base64 并清理潜在的换行/空格污染
+    local safe_link=$(echo -n "$link" | tr -- '-_' '+/'  | tr -d ' \n\r')
+    local pad=$((4 - ${#safe_link} % 4))
+    [ $pad -ne 4 ] && safe_link+=$(printf '=%.0s' $(seq 1 $pad))
+    local decoded=$(echo -n "$safe_link" | base64 -d 2>/dev/null)
     [ -z "$decoded" ] && { echo '{"error": "Base64解码失败"}'; return; }
     
     local server=$(echo "$decoded" | jq -r '.add')
@@ -171,11 +166,64 @@ _parse_hy2() {
     fi
 }
 
+# 解析 TUIC
+_parse_tuic() {
+    local link="$1"
+    local regex="tuic://([^:]+):([^@]+)@([^:/?#]+):([0-9]+)\\??([^#]*)#?(.*)"
+    if [[ $link =~ $regex ]]; then
+        local uuid="${BASH_REMATCH[1]}"
+        local password=$(_decode "${BASH_REMATCH[2]}")
+        local server="${BASH_REMATCH[3]}"
+        local port="${BASH_REMATCH[4]}"
+        local params="${BASH_REMATCH[5]}"
+        local sni=$(_get_param "$params" "sni")
+        local cc=$(_get_param "$params" "congestion_control")
+        [ -z "$cc" ] && cc="bbr"
+
+        jq -n --arg s "$server" --argjson p "$port" --arg u "$uuid" --arg pw "$password" --arg sni "${sni:-$server}" --arg cc "$cc" \
+            '{type:"tuic", tag:"proxy", server:$s, server_port:$p, uuid:$u, password:$pw, congestion_control:$cc, tls:{enabled:true, server_name:$sni, insecure:true, alpn:["h3"]}}'
+    fi
+}
+
+# 解析 AnyTLS
+_parse_anytls() {
+    local link="$1"
+    local regex="anytls://([^@]+)@([^:/?#]+):([0-9]+)\\??([^#]*)#?(.*)"
+    if [[ $link =~ $regex ]]; then
+        local password=$(_decode "${BASH_REMATCH[1]}")
+        local server="${BASH_REMATCH[2]}"
+        local port="${BASH_REMATCH[3]}"
+        local params="${BASH_REMATCH[4]}"
+        local sni=$(_get_param "$params" "sni")
+
+        jq -n --arg s "$server" --argjson p "$port" --arg pw "$password" --arg sni "${sni:-$server}" \
+            '{type:"anytls", tag:"proxy", server:$s, server_port:$p, password:$pw, tls:{enabled:true, server_name:$sni, insecure:true}}'
+    fi
+}
+
+# 解析 SOCKS5
+_parse_socks() {
+    local link="$1"
+    local regex="socks5://([^:]+):([^@]+)@([^:/?#]+):([0-9]+)#?(.*)"
+    if [[ $link =~ $regex ]]; then
+        local user="${BASH_REMATCH[1]}"
+        local pass="${BASH_REMATCH[2]}"
+        local server="${BASH_REMATCH[3]}"
+        local port="${BASH_REMATCH[4]}"
+        
+        jq -n --arg s "$server" --argjson p "$port" --arg u "$user" --arg pw "$pass" \
+            '{type:"socks", tag:"proxy", server:$s, server_port:$p, version:"5", users:[{username:$u, password:$pass}]}'
+    fi
+}
+
 case "$1" in
     vless://*) _parse_vless "$1" ;;
     vmess://*) _parse_vmess "$1" ;;
     trojan://*) _parse_trojan "$1" ;;
     ss://*) _parse_ss "$1" ;;
     hysteria2://*|hy2://*) _parse_hy2 "$1" ;;
+    tuic://*) _parse_tuic "$1" ;;
+    anytls://*) _parse_anytls "$1" ;;
+    socks5://*) _parse_socks "$1" ;;
     *) echo "{\"error\": \"不支持的协议\"}"; exit 1 ;;
 esac

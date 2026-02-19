@@ -1,38 +1,121 @@
 #!/bin/bash
 
-# 引入工具库 (Self-Initialization Logic)
+# 核心环境定义
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
-GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
+SINGBOX_BIN="/usr/local/bin/sing-box"
 
-if [ -f "$SCRIPT_DIR/utils.sh" ]; then
-    source "$SCRIPT_DIR/utils.sh"
-elif [ -f "${SINGBOX_DIR}/utils.sh" ]; then
-    source "${SINGBOX_DIR}/utils.sh"
-else
-    echo "检测到缺失核心组件: utils.sh，正在尝试自动补全..."
-    if command -v curl &>/dev/null; then
-        curl -LfSs "$GITHUB_RAW_BASE/utils.sh" -o "$SCRIPT_DIR/utils.sh"
-    elif command -v wget &>/dev/null; then
-        wget -qO "$SCRIPT_DIR/utils.sh" "$GITHUB_RAW_BASE/utils.sh"
-    fi
-    [ -f "$SCRIPT_DIR/utils.sh" ] && chmod +x "$SCRIPT_DIR/utils.sh"
-    [ -f "$SCRIPT_DIR/utils.sh" ] && source "$SCRIPT_DIR/utils.sh"
+# [整合方案] 检测父进程导出的工具函数
+# 如果独立运行且函数缺失，可在此定义最简兜底逻辑 (可选)
+# 颜色定义
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+# 打印消息函数 (强制重定向到 stderr，防止干扰变量捕获)
+if ! declare -f _info >/dev/null; then
+    _info() { echo -e "${CYAN}[信息] $1${NC}" >&2; }
+    _error() { echo -e "${RED}[错误] $1${NC}" >&2; }
+    _success() { echo -e "${GREEN}[成功] $1${NC}" >&2; }
+    _warn() { echo -e "${YELLOW}[注意] $1${NC}" >&2; }
 fi
 
 # --- 全局变量 ---
-# 主脚本配置路径
+# 工具路径
+SINGBOX_BIN="/usr/local/bin/sing-box"
+YQ_BINARY="/usr/local/bin/yq"
+
+# 配置文件路径
 MAIN_CONFIG_FILE="${SINGBOX_DIR}/config.json"
 MAIN_METADATA_FILE="${SINGBOX_DIR}/metadata.json"
-
-# 辅助文件目录 (存放中转机的证书和链接信息)
 RELAY_AUX_DIR="${SINGBOX_DIR}"
-# 中转机专用 YAML 配置文件
 RELAY_CLASH_YAML="${RELAY_AUX_DIR}/clash.yaml"
-# 中转/适配层专用 JSON 配置文件 (隔离配置)
 RELAY_CONFIG_FILE="${RELAY_AUX_DIR}/relay.json"
 
-SINGBOX_BIN="/usr/local/bin/sing-box"
+# 核心环境检测
+_detect_init_system() {
+    if [ -f /etc/openrc/rc.conf ]; then
+        INIT_SYSTEM="openrc"
+    else
+        INIT_SYSTEM="systemd"
+    fi
+}
+[ -z "$INIT_SYSTEM" ] && _detect_init_system
+
+# 公网 IP 获取 (带全局缓存)
+server_ip=""
+_get_public_ip() {
+    [ -n "$server_ip" ] && [ "$server_ip" != "null" ] && { echo "$server_ip"; return; }
+    local ip=$(timeout 5 curl -s4 --max-time 2 icanhazip.com 2>/dev/null || timeout 5 curl -s4 --max-time 2 ipinfo.io/ip 2>/dev/null)
+    [ -z "$ip" ] && ip=$(timeout 5 curl -s6 --max-time 2 icanhazip.com 2>/dev/null || timeout 5 curl -s6 --max-time 2 ipinfo.io/ip 2>/dev/null)
+    server_ip="$ip"
+    echo "$ip"
+}
+
+# 端口冲突检测
+_check_port_occupied() {
+    local port=$1
+    if command -v netstat &>/dev/null; then
+        netstat -tuln | grep -q ":$port "
+    elif command -v ss &>/dev/null; then
+        ss -tuln | grep -q ":$port "
+    else
+        lsof -i ":$port" &>/dev/null
+    fi
+}
+
+# IPTables 规则保存
+_save_iptables_rules() {
+    _info "正在保存 IPTables 规则..."
+    if command -v netfilter-persistent &>/dev/null; then
+        netfilter-persistent save >/dev/null 2>&1
+    elif command -v iptables-save &>/dev/null; then
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4
+    fi
+}
+
+# 原子修改 JSON
+_atomic_modify_json() {
+    local file="$1" filter="$2"
+    [ ! -f "$file" ] && return 1
+    local tmp="${file}.tmp"
+    if jq "$filter" "$file" > "$tmp" 2>/dev/null; then
+        mv "$tmp" "$file"
+    else
+        _error "修改 JSON 失败: $file"; rm -f "$tmp"; return 1
+    fi
+}
+
+# 单个原子修改 YAML
+_atomic_modify_yaml() {
+    local file="$1" filter="$2"
+    [ ! -f "$file" ] && return 1
+    local tmp="${file}.tmp"
+    cp "$file" "$tmp"
+    if ${YQ_BINARY} eval "$filter" -i "$file" 2>/dev/null; then
+        rm "$tmp"
+    else
+        _error "修改 YAML 失败: $file"; mv "$tmp" "$file"; return 1
+    fi
+}
+
+# 服务管理
+_manage_service() {
+    local action="$1"
+    # 中转脚本可能使用独立服务或主服务，此处保持与主脚本一致的逻辑
+    local service_pkg="sing-box"
+    # 如果检测到中转专用服务文件，则使用单机中转模式
+    [ -f "/etc/systemd/system/sing-box-relay.service" ] && service_pkg="sing-box-relay"
+
+    _info "执行服务操作: $action ($service_pkg)..."
+    case "$INIT_SYSTEM" in
+        systemd) systemctl "$action" "$service_pkg" ;;
+        openrc) rc-service "$service_pkg" "$action" ;;
+    esac
+}
 
 # 日志记录函数
 _log_operation() {
@@ -47,8 +130,7 @@ _add_node_to_relay_yaml() {
     local proxy_json="$1"
     local proxy_name=$(echo "$proxy_json" | jq -r .name)
     
-    # 使用 yq 添加节点（需要主脚本的 yq）
-    local YQ_BINARY="/usr/local/bin/yq"
+    # 使用 utils.sh 中定义的全局 YQ_BINARY
     if [ ! -f "$YQ_BINARY" ]; then
         _warn "未找到 yq 工具，跳过 YAML 配置生成"
         return
@@ -64,10 +146,13 @@ _add_node_to_relay_yaml() {
     local temp_json="/tmp/relay_node_$$.json"
     echo "$proxy_json" > "$temp_json"
     
-    # 使用 yq 从文件读取并添加
-    ${YQ_BINARY} eval ".proxies += [$(cat $temp_json)]" -i "$RELAY_CLASH_YAML" 2>/dev/null
-    # 使用环境变量避免特殊字符问题
-    PROXY_NAME="$proxy_name" ${YQ_BINARY} eval '.proxy-groups[] |= (select(.name == "中转节点") | .proxies += [env(PROXY_NAME)] | .proxies |= unique)' -i "$RELAY_CLASH_YAML" 2>/dev/null
+    # 使用环境变量传递 JSON 字符串，确保安全性
+    export NODE_JSON="$(cat $temp_json)"
+    ${YQ_BINARY} eval '.proxies += [env(NODE_JSON)]' -i "$RELAY_CLASH_YAML" 2>/dev/null
+    
+    # 使用环境变量避免名称中特殊字符问题
+    export PROXY_NAME="$proxy_name"
+    ${YQ_BINARY} eval '.proxy-groups[] |= (select(.name == "中转节点") | .proxies += [env(PROXY_NAME)] | .proxies |= unique)' -i "$RELAY_CLASH_YAML" 2>/dev/null
     
     # 清理临时文件
     rm -f "$temp_json"
@@ -77,7 +162,7 @@ _add_node_to_relay_yaml() {
 
 _remove_node_from_relay_yaml() {
     local proxy_name="$1"
-    local YQ_BINARY="/usr/local/bin/yq"
+    # 使用 utils.sh 中定义的全局 YQ_BINARY
     
     if [ ! -f "$YQ_BINARY" ]; then
         return
@@ -88,8 +173,9 @@ _remove_node_from_relay_yaml() {
     fi
     
     # 删除节点 - 使用环境变量避免特殊字符问题
-    PROXY_NAME="$proxy_name" ${YQ_BINARY} eval 'del(.proxies[] | select(.name == env(PROXY_NAME)))' -i "$RELAY_CLASH_YAML" 2>/dev/null
-    PROXY_NAME="$proxy_name" ${YQ_BINARY} eval '.proxy-groups[] |= (select(.name == "中转节点") | .proxies |= del(.[] | select(. == env(PROXY_NAME))))' -i "$RELAY_CLASH_YAML" 2>/dev/null
+    export PROXY_NAME="$proxy_name"
+    ${YQ_BINARY} eval 'del(.proxies[] | select(.name == env(PROXY_NAME)))' -i "$RELAY_CLASH_YAML" 2>/dev/null
+    ${YQ_BINARY} eval '.proxy-groups[] |= (select(.name == "中转节点") | .proxies |= del(.[] | select(. == env(PROXY_NAME))))' -i "$RELAY_CLASH_YAML" 2>/dev/null
     
     _info "已从 YAML 配置中删除节点: ${proxy_name}"
 }
@@ -239,8 +325,7 @@ _landing_config() {
     
     # 获取本机IP，作为备选
     local server_ip=$(_get_public_ip)
-    # 定义 YQ 和 CLASH 配置文件路径
-    local YQ_BINARY="/usr/local/bin/yq"
+    # 使用主脚本中定义的全局 YQ_BINARY 和路径常量
     local MAIN_CLASH_YAML="/usr/local/etc/sing-box/clash.yaml"
     local METADATA_FILE="/usr/local/etc/sing-box/metadata.json"
 
@@ -260,30 +345,28 @@ _landing_config() {
     
     while IFS= read -r node; do
         [ -z "$node" ] && continue
-        local tag=$(echo "$node" | jq -r '.tag')
-        local type=$(echo "$node" | jq -r '.type')
-        local port=$(echo "$node" | jq -r '.listen_port')
+        # [资源优化] 合并3次jq为1次
+        local _node_fields
+        _node_fields=$(echo "$node" | jq -r '[.tag, .type, (.listen_port|tostring), (.method // "")] | @tsv')
+        local tag type port method
+        IFS=$'\t' read -r tag type port method <<< "$_node_fields"
         
         # [屏蔽逻辑] 屏蔽 SS-2022 节点
-        if [ "$type" == "shadowsocks" ]; then
-            local method=$(echo "$node" | jq -r '.method // empty')
-            if [[ "$method" == *"2022"* ]]; then
-                has_ss2022=true
-                continue
-            fi
+        if [ "$type" == "shadowsocks" ] && [[ "$method" == *"2022"* ]]; then
+            has_ss2022=true
+            continue
         fi
         
         # 尝试从 metadata 中获取自定义名称
         local display_name="$tag"
         if [ -f "$METADATA_FILE" ]; then
-            local node_meta=$(jq -r --arg t "$tag" '.[$t] // empty' "$METADATA_FILE" 2>/dev/null)
-            if [ -n "$node_meta" ]; then
-                local node_type=$(echo "$node_meta" | jq -r '.type // empty')
-                if [ "$node_type" == "third-party-adapter" ]; then
-                    local adapter_name=$(echo "$node_meta" | jq -r '.adapter_name // empty')
-                    local adapter_type=$(echo "$node_meta" | jq -r '.adapter_type // empty')
-                    [ -n "$adapter_name" ] && display_name="${adapter_name} [${adapter_type}适配层]"
-                fi
+            # [资源优化] 合并3次meta jq为1次
+            local _meta_fields
+            _meta_fields=$(jq -r --arg t "$tag" '.[$t] // {} | [(.type // ""), (.adapter_name // ""), (.adapter_type // "")] | @tsv' "$METADATA_FILE" 2>/dev/null)
+            local node_type adapter_name adapter_type
+            IFS=$'\t' read -r node_type adapter_name adapter_type <<< "$_meta_fields"
+            if [ "$node_type" == "third-party-adapter" ] && [ -n "$adapter_name" ]; then
+                display_name="${adapter_name} [${adapter_type}适配层]"
             fi
         fi
         
@@ -303,9 +386,10 @@ _landing_config() {
     fi
     
     local selected_node=${node_list[$((choice-1))]}
-    local tag=$(echo "$selected_node" | jq -r '.tag')
-    local type=$(echo "$selected_node" | jq -r '.type')
-    local port=$(echo "$selected_node" | jq -r '.listen_port')
+    # [资源优化] 合并3次jq为1次 (重复提取tag/type/port)
+    local _sel_fields
+    _sel_fields=$(echo "$selected_node" | jq -r '[.tag, .type, (.listen_port|tostring)] | @tsv')
+    IFS=$'\t' read -r tag type port <<< "$_sel_fields"
     
     # 自动检测地址
     local token_addr="$server_ip"
@@ -331,30 +415,33 @@ _landing_config() {
     local outbound_json=""
     case "$type" in
         "vless")
-            local uuid=$(echo "$selected_node" | jq -r '.users[0].uuid')
-            local flow=$(echo "$selected_node" | jq -r '.users[0].flow // ""')
+            # [资源优化] 合并vless基础字段2次jq为1次
+            local uuid flow
+            IFS=$'\t' read -r uuid flow <<< "$(echo "$selected_node" | jq -r '[.users[0].uuid, (.users[0].flow // "")] | @tsv')"
             outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg u "$uuid" --arg f "$flow" \
                 '{"type":"vless","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"uuid":$u,"flow":$f}')
             
-            # 处理 TLS / Reality
-            if [ "$(echo "$selected_node" | jq -r '.tls.enabled // false')" == "true" ]; then
-                local sni=$(echo "$selected_node" | jq -r '.tls.server_name // empty')
+            # [资源优化] 合并TLS字段提取3次jq为1次
+            local _tls_fields
+            _tls_fields=$(echo "$selected_node" | jq -r '[(.tls.enabled // false | tostring), (.tls.server_name // ""), (.tls.reality.enabled // false | tostring)] | @tsv')
+            local tls_enabled sni reality_enabled
+            IFS=$'\t' read -r tls_enabled sni reality_enabled <<< "$_tls_fields"
+            
+            if [ "$tls_enabled" == "true" ]; then
                 # 尝试从 clash.yaml 获取 SNI (如果 inbound 里没存)
                 if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
-                    sni=$(${YQ_BINARY} r "$MAIN_CLASH_YAML" "proxies.(port==$port).servername" 2>/dev/null || \
-                          ${YQ_BINARY} r "$MAIN_CLASH_YAML" "proxies.(port==$port).sni" 2>/dev/null || \
-                          ${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .servername // .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
+                    sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .servername // .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
                 fi
                 [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.apple.com" # 极简保底
 
                 local utls_json='{"enabled":true,"fingerprint":"chrome"}'
                 
-                if [ "$(echo "$selected_node" | jq -r '.tls.reality.enabled // false')" == "true" ]; then
+                if [ "$reality_enabled" == "true" ]; then
                     # Reality 需要从 metadata 读取 publicKey
                     local pbk="" sid=""
                     if [ -f "$MAIN_METADATA_FILE" ]; then
-                        pbk=$(jq -r --arg t "$tag" '.[$t].publicKey // empty' "$MAIN_METADATA_FILE")
-                        sid=$(jq -r --arg t "$tag" '.[$t].shortId // empty' "$MAIN_METADATA_FILE")
+                        # [资源优化] 合并2次meta jq为1次
+                        IFS=$'\t' read -r pbk sid <<< "$(jq -r --arg t "$tag" '.[$t] | [(.publicKey // ""), (.shortId // "")] | @tsv' "$MAIN_METADATA_FILE")"
                     fi
                     [ -z "$pbk" ] && _warn "Reality 节点未在 metadata 中找到公钥，可能无法连接。"
                     outbound_json=$(echo "$outbound_json" | jq --arg sni "$sni" --arg pbk "$pbk" --arg sid "$sid" --argjson utls "$utls_json" \
@@ -365,14 +452,15 @@ _landing_config() {
                 fi
             fi
             
-            # 处理 Transport (WS)
-            if [ "$(echo "$selected_node" | jq -r '.transport.type // ""')" == "ws" ]; then
-                local path=$(echo "$selected_node" | jq -r '.transport.path // "/"')
-                local host=$(echo "$selected_node" | jq -r '.transport.headers.Host // empty')
+            # 处理 Transport (WS) - 合并多次jq为1次
+            local _ws_fields
+            _ws_fields=$(echo "$selected_node" | jq -r '[(.transport.type // ""), (.transport.path // "/"), (.transport.headers.Host // "")] | @tsv')
+            local trans_type path host
+            IFS=$'\t' read -r trans_type path host <<< "$_ws_fields"
+            if [ "$trans_type" == "ws" ]; then
                 # 尝试从 clash.yaml 获取 Host
                 if [ -z "$host" ] && [ -f "$MAIN_CLASH_YAML" ]; then
-                    host=$(${YQ_BINARY} r "$MAIN_CLASH_YAML" 'proxies.(port=='$port').ws-opts.headers.Host' 2>/dev/null || \
-                           ${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .\"ws-opts\".headers.Host" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
+                    host=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .\"ws-opts\".headers.Host" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
                 fi
                 [ -z "$host" ] || [ "$host" == "null" ] && host="$sni" # 兜底使用 SNI
                 
@@ -382,6 +470,7 @@ _landing_config() {
             ;;
             
         "shadowsocks")
+            # [修复] 放弃对密码字段使用 @tsv
             local method=$(echo "$selected_node" | jq -r '.method')
             local password=$(echo "$selected_node" | jq -r '.password')
             outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg m "$method" --arg pw "$password" \
@@ -393,23 +482,28 @@ _landing_config() {
             outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg pw "$password" \
                 '{"type":"trojan","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"password":$pw}')
             
-            if [ "$(echo "$selected_node" | jq -r '.tls.enabled // false')" == "true" ]; then
-                local sni=$(echo "$selected_node" | jq -r '.tls.server_name // empty')
+            # [资源优化] 合并TLS字段提取2次jq为1次
+            local _trojan_tls_fields
+            _trojan_tls_fields=$(echo "$selected_node" | jq -r '[(.tls.enabled // false | tostring), (.tls.server_name // "")] | @tsv')
+            local tls_enabled sni
+            IFS=$'\t' read -r tls_enabled sni <<< "$_trojan_tls_fields"
+            
+            if [ "$tls_enabled" == "true" ]; then
                 if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
-                    sni=$(${YQ_BINARY} r "$MAIN_CLASH_YAML" "proxies.(port==$port).sni" 2>/dev/null || \
-                          ${YQ_BINARY} r "$MAIN_CLASH_YAML" "proxies.(port==$port).servername" 2>/dev/null || \
-                          ${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni // .servername" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
+                    sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni // .servername" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
                 fi
                 [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.apple.com"
                 outbound_json=$(echo "$outbound_json" | jq --arg sni "$sni" '.tls = {enabled:true, server_name:$sni, insecure:true}')
             fi
             
-            if [ "$(echo "$selected_node" | jq -r '.transport.type // ""')" == "ws" ]; then
-                local path=$(echo "$selected_node" | jq -r '.transport.path // "/"')
-                local host=$(echo "$selected_node" | jq -r '.transport.headers.Host // empty')
+            # [资源优化] 合并transport字段提取3次jq为1次
+            local _trojan_ws_fields
+            _trojan_ws_fields=$(echo "$selected_node" | jq -r '[(.transport.type // ""), (.transport.path // "/"), (.transport.headers.Host // "")] | @tsv')
+            local trans_type path host
+            IFS=$'\t' read -r trans_type path host <<< "$_trojan_ws_fields"
+            if [ "$trans_type" == "ws" ]; then
                 if [ -z "$host" ] && [ -f "$MAIN_CLASH_YAML" ]; then
-                    host=$(${YQ_BINARY} r "$MAIN_CLASH_YAML" 'proxies.(port=='$port').ws-opts.headers.Host' 2>/dev/null || \
-                           ${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .\"ws-opts\".headers.Host" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
+                    host=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .\"ws-opts\".headers.Host" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
                 fi
                 [ -z "$host" ] || [ "$host" == "null" ] && host="$sni"
                 outbound_json=$(echo "$outbound_json" | jq --arg path "$path" --arg host "$host" \
@@ -418,16 +512,15 @@ _landing_config() {
             ;;
 
         "hysteria2")
+            # [修复] 放弃对密钥字段使用 @tsv
             local password=$(echo "$selected_node" | jq -r '.users[0].password')
-            local sni=$(echo "$selected_node" | jq -r '.tls.server_name // empty')
+            local sni=$(echo "$selected_node" | jq -r '.tls.server_name // ""')
+            local obfs_type=$(echo "$selected_node" | jq -r '.obfs.type // ""')
+            local obfs_pw=$(echo "$selected_node" | jq -r '.obfs.password // ""')
             if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
-                sni=$(${YQ_BINARY} r "$MAIN_CLASH_YAML" "proxies.(port==$port).sni" 2>/dev/null || \
-                      ${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
+                sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
             fi
             [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.apple.com"
-
-            local obfs_type=$(echo "$selected_node" | jq -r '.obfs.type // empty')
-            local obfs_pw=$(echo "$selected_node" | jq -r '.obfs.password // empty')
 
             outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg pw "$password" --arg sni "$sni" \
                 '{"type":"hysteria2","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"password":$pw,"tls":{"enabled":true,"server_name":$sni,"insecure":true,"alpn":["h3"]}}')
@@ -438,26 +531,27 @@ _landing_config() {
             ;;
 
         "tuic")
+            # [修复] 放弃对 UUID/Password 使用 @tsv
             local uuid=$(echo "$selected_node" | jq -r '.users[0].uuid')
             local password=$(echo "$selected_node" | jq -r '.users[0].password')
-            local sni=$(echo "$selected_node" | jq -r '.tls.server_name // empty')
+            local sni=$(echo "$selected_node" | jq -r '.tls.server_name // ""')
+            local cc=$(echo "$selected_node" | jq -r '.congestion_control // "bbr"')
+            
             if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
-                sni=$(${YQ_BINARY} r "$MAIN_CLASH_YAML" "proxies.(port==$port).sni" 2>/dev/null || \
-                      ${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
+                sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
             fi
             [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.apple.com"
 
-            local cc=$(echo "$selected_node" | jq -r '.congestion_control // "bbr"')
             outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sni "$sni" --arg cc "$cc" \
                 '{"type":"tuic","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"uuid":$u,"password":$pw,"congestion_control":$cc,"tls":{"enabled":true,"server_name":$sni,"insecure":true,"alpn":["h3"]}}')
             ;;
 
         "anytls")
-            local password=$(echo "$selected_node" | jq -r '.users[0].password')
-            local sni=$(echo "$selected_node" | jq -r '.tls.server_name // empty')
+            # [资源优化] 合并2次jq为1次
+            local password sni
+            IFS=$'\t' read -r password sni <<< "$(echo "$selected_node" | jq -r '[.users[0].password, (.tls.server_name // "")] | @tsv')"
             if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
-                sni=$(${YQ_BINARY} r "$MAIN_CLASH_YAML" "proxies.(port==$port).sni" 2>/dev/null || \
-                      ${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
+                sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
             fi
             [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.apple.com"
             outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg pw "$password" --arg sni "$sni" \
@@ -671,11 +765,15 @@ _finalize_relay_setup() {
     fi
     [ -n "$proxy_json" ] && _add_node_to_relay_yaml "$proxy_json"
     
-    echo "==================================================="
-    _success "中转配置成功！"
-    echo -e "  中转节点: ${YELLOW}$node_name${NC}"
-    echo -e "  分享链接: ${CYAN}$link${NC}"
-    echo "==================================================="
+    echo -e "${YELLOW}═══════════════════ 配置成功 ═══════════════════${NC}"
+    _success "中转配置已生效！"
+    echo -e "  节点名称: ${GREEN}$node_name${NC}"
+    echo -e "  中转协议: ${CYAN}$relay_type${NC}"
+    echo -e "  落地地址: ${CYAN}$landing_info${NC}"
+    echo -e "  本地监听: ${WHITE}$listen_port${NC}"
+    echo -e "分享链接:"
+    echo -e "${CYAN}$link${NC}"
+    echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
     read -p "  按回车键返回..."
 }
 
@@ -725,7 +823,12 @@ _relay_config() {
 
 # --- 3. 查看中转路由 ---
 _view_relays() {
-    echo -e "\n  ${CYAN}【当前中转链路列表】${NC}"
+    clear
+    echo -e "${CYAN}"
+    echo "  ╔═══════════════════════════════════════╗"
+    echo "  ║         当前中转链路列表              ║"
+    echo "  ╚═══════════════════════════════════════╝"
+    echo -e "${NC}"
     
     local CONFIG_FILE="$RELAY_CONFIG_FILE"
     if [ ! -f "$CONFIG_FILE" ]; then _error "配置文件不存在。"; return; fi
@@ -733,7 +836,8 @@ _view_relays() {
     local rules=$(jq -c '.route.rules[] | select(.inbound != null and .outbound != null and (.outbound | startswith("relay-out-")))' "$CONFIG_FILE" 2>/dev/null)
     
     if [ -z "$rules" ]; then
-        echo -e "    ${YELLOW}暂无活跃中转链路${NC}"
+        echo -e "\n    ${YELLOW}暂无活跃中转链路${NC}"
+        echo ""
         read -p "  按回车键继续..."
         return
     fi
@@ -742,10 +846,13 @@ _view_relays() {
     local i=1
     
     while IFS= read -r rule; do
+        [ -z "$rule" ] && continue
         local in_tag=$(echo "$rule" | jq -r '.inbound')
         local metadata=""
         local link=""
         local landing_info="--"
+        local node_name="未知节点"
+        local relay_type="--"
         
         if [ -f "$LINKS_FILE" ]; then
             metadata=$(jq -r --arg t "$in_tag" '.[$t] // empty' "$LINKS_FILE")
@@ -753,15 +860,20 @@ _view_relays() {
                 if echo "$metadata" | jq -e '.link' >/dev/null 2>&1; then
                     link=$(echo "$metadata" | jq -r '.link')
                     landing_info=$(echo "$metadata" | jq -r '.landing_addr // "未知"')
+                    node_name=$(echo "$metadata" | jq -r '.node_name // "未知节点"')
+                    relay_type=$(echo "$metadata" | jq -r '.relay_type // "--"')
                 else
                     link="$metadata"
                 fi
             fi
         fi
-        
-        echo -e "  ${GREEN}● [$i] ${in_tag}${NC}"
-        echo -e "    落地: ${landing_info}"
-        echo -e "    链接: ${link}"
+
+        echo -e "  ${GREEN}[$i]${NC} ${YELLOW}${node_name}${NC}"
+        echo -e "      入口索引: ${CYAN}${in_tag}${NC}"
+        echo -e "      中转方式: ${relay_type}"
+        echo -e "      落地目标: ${landing_info}"
+        [ -n "$link" ] && echo -e "      分享链接: ${CYAN}${link}${NC}"
+        echo "  -------------------------------------------------"
         ((i++))
     done <<< "$rules"
     
@@ -793,19 +905,20 @@ _delete_relay() {
         [ -z "$rule" ] && continue
         local in_tag=$(echo "$rule" | jq -r '.inbound')
         local metadata=""
-        local link=""
         local landing_info="--"
+        local node_name="未知节点"
         
         if [ -f "$LINKS_FILE" ]; then
             metadata=$(jq -r --arg t "$in_tag" '.[$t] // empty' "$LINKS_FILE")
             if [ -n "$metadata" ]; then
                 if echo "$metadata" | jq -e '.link' >/dev/null 2>&1; then
                     landing_info=$(echo "$metadata" | jq -r '.landing_addr // "未知"')
+                    node_name=$(echo "$metadata" | jq -r '.node_name // "未知节点"')
                 fi
             fi
         fi
         
-        echo -e "  ${GREEN}[$i]${NC} ${in_tag} -> 落地: ${landing_info}"
+        echo -e "  ${GREEN}[$i]${NC} ${YELLOW}${node_name}${NC} (${landing_info})"
         rules_list+=("$rule")
         ((i++))
     done <<< "$rules"
@@ -828,10 +941,9 @@ _delete_relay() {
             # 简化逻辑：直接重置配置文件
             echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
             echo '{}' > "${RELAY_AUX_DIR}/relay_links.json"
-            rm -f "${RELAY_AUX_DIR}/*.pem" "${RELAY_AUX_DIR}/*.key" 2>/dev/null
+            rm -f ${RELAY_AUX_DIR}/*.pem ${RELAY_AUX_DIR}/*.key 2>/dev/null
             
             # 清空 YAML
-            local YQ_BINARY="/usr/local/bin/yq"
             if [ -f "$RELAY_CLASH_YAML" ] && [ -f "$YQ_BINARY" ]; then
                 ${YQ_BINARY} eval '.proxies = []' -i "$RELAY_CLASH_YAML"
                 ${YQ_BINARY} eval '.proxy-groups[0].proxies = []' -i "$RELAY_CLASH_YAML"
@@ -939,7 +1051,7 @@ _modify_relay_port() {
         # 如果找到了节点名称，更新 YAML 中的端口
         if [ -n "$node_name_yaml" ]; then
             _info "正在同步更新 YAML 配置中的端口..."
-            ${YQ_BINARY} eval '(.proxies[] | select(.name == "'${node_name_yaml}'") | .port) = '${new_port} -i "$RELAY_CLASH_YAML"
+            RELAY_NODE_NAME="$node_name_yaml" ${YQ_BINARY} eval '(.proxies[] | select(.name == env(RELAY_NODE_NAME)) | .port) = '${new_port} -i "$RELAY_CLASH_YAML"
             _success "YAML 配置已同步更新"
         fi
     fi
@@ -961,12 +1073,40 @@ _menu() {
 
     while true; do
         clear
+        # ASCII Logo (对齐主脚本)
         echo -e "${CYAN}"
-        echo '  ╔═══════════════════════════════════════╗'
-        echo '  ║       singbox-lite 进阶转发管理       ║'
-        echo '  ║                (v11)                  ║'
-        echo '  ╚═══════════════════════════════════════╝'
+        echo '  ____  _             ____            '
+        echo ' / ___|(_)_ __   __ _| __ )  _____  __'
+        echo ' \___ \| | '\''_ \ / _` |  _ \ / _ \ \/ /'
+        echo '  ___) | | | | | (_| | |_) | (_) >  < '
+        echo ' |____/|_|_| |_|\__, |____/ \___/_/\_\'
+        echo '                |___/    Lite Manager '
         echo -e "${NC}"
+
+        # 标题框
+        echo -e "${CYAN}"
+        echo "  ╔═══════════════════════════════════════╗"
+        echo "  ║       singbox-lite 进阶转发管理       ║"
+        echo "  ║                (v12)                  ║"
+        echo "  ╚═══════════════════════════════════════╝"
+        echo -e "${NC}"
+
+        # 获取系统信息与服务状态
+        local os_info="Linux"
+        [ -f /etc/os-release ] && os_info=$(grep -E "^NAME=" /etc/os-release | cut -d'"' -f2 | head -1)
+        
+        local service_status="${RED}○ 已停止${NC}"
+        local service_name="sing-box"
+        [ -f "/etc/systemd/system/sing-box-relay.service" ] && service_name="sing-box-relay"
+        
+        if [ "$INIT_SYSTEM" == "systemd" ]; then
+            systemctl is-active --quiet "$service_name" && service_status="${GREEN}● 运行中${NC}"
+        else
+            rc-service "$service_name" status 2>/dev/null | grep -q "started" && service_status="${GREEN}● 运行中${NC}"
+        fi
+
+        echo -e "  系统版本: ${CYAN}${os_info}${NC}"
+        echo -e "  中转服务: ${service_status} (${service_name})"
         echo ""
         echo -e "  ${CYAN}【基础配置】${NC}"
         echo -e "    ${GREEN}[1]${NC} 落地机：生成全协议 Token"
@@ -990,7 +1130,18 @@ _menu() {
             4) _view_relays ;;
             5) _delete_relay ;;
             6) _modify_relay_port ;;
-            7) echo ""; _warn "确认清空所有中转配置?"; read -p "  (y/N): " cn; [ "$cn" == "y" ] && echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE" && echo '{}' > "${RELAY_AUX_DIR}/relay_links.json" && _manage_service restart ;;
+            7) echo ""; _warn "确认清空所有中转配置?"; read -p "  (y/N): " cn;
+               if [ "$cn" == "y" ]; then
+                   echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
+                   echo '{}' > "${RELAY_AUX_DIR}/relay_links.json"
+                   rm -f ${RELAY_AUX_DIR}/*.pem ${RELAY_AUX_DIR}/*.key 2>/dev/null
+                   if [ -f "$RELAY_CLASH_YAML" ] && [ -f "$YQ_BINARY" ]; then
+                       export PROXY_NAME_DUMMY="DUMMY"
+                       ${YQ_BINARY} eval '.proxies = [] | .proxy-groups[0].proxies = []' -i "$RELAY_CLASH_YAML" 2>/dev/null
+                   fi
+                   _manage_service restart
+                   _success "全部中转已清空"
+               fi ;;
             0) exit 0 ;;
             *) _error "无效输入"; sleep 1 ;;
         esac
