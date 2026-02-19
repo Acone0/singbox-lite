@@ -3245,50 +3245,68 @@ _modify_port() {
     # 1. 修改 config.json
     _atomic_modify_json "$CONFIG_FILE" ".inbounds[$index].listen_port = $new_port" || return
     
-    # 2. 修改 clash.yaml
-    # [M1] 使用公共函数替代内联重复的代理名查找逻辑
-    local proxy_name_in_yaml=$(_find_proxy_name "$old_port" "$type_to_modify")
-    
-    if [ -n "$proxy_name_in_yaml" ]; then
-        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == "'${proxy_name_in_yaml}'") | .port) = '${new_port}
+    # 2. 修改 clash.yaml (全链路同步模式)
+    local old_proxy_name=$(_find_proxy_name "$old_port" "$type_to_modify")
+    if [ -n "$old_proxy_name" ]; then
+        # 生成新名字：将名字中的旧端口替换为新端口
+        local new_proxy_name=$(echo "$old_proxy_name" | sed "s/${old_port}/${new_port}/g")
+        
+        export OLD_NAME="$old_proxy_name"
+        export NEW_NAME="$new_proxy_name"
+        export NEW_PORT_VAL="$new_port"
+        
+        # 原子改名与改端口
+        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(OLD_NAME)) | .name) = env(NEW_NAME)'
+        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxies[] | select(.name == env(NEW_NAME)) | .port) = (env(NEW_PORT_VAL)|tonumber)'
+        
+        # 全局同步更新所有分组中的引用
+        _atomic_modify_yaml "$CLASH_YAML_FILE" '(.proxy-groups[].proxies[] | select(. == env(OLD_NAME))) = env(NEW_NAME)'
+        
+        _info "Clash 节点名同步: ${old_proxy_name} -> ${new_proxy_name}"
     fi
     
-    # 3. 处理证书文件重命名（Hysteria2, TUIC, AnyTLS）
-    if [ "$type_to_modify" == "hysteria2" ] || [ "$type_to_modify" == "tuic" ] || [ "$type_to_modify" == "anytls" ]; then
-        local old_cert="${SINGBOX_DIR}/${tag_to_modify}.pem"
-        local old_key="${SINGBOX_DIR}/${tag_to_modify}.key"
-        
-        # 生成新的 tag (基于新端口)
-        local new_tag_suffix="$new_port"
-        if [ "$type_to_modify" == "hysteria2" ]; then
-            local new_tag="hy2-in-${new_tag_suffix}"
-        elif [ "$type_to_modify" == "tuic" ]; then
-            local new_tag="tuic-in-${new_tag_suffix}"
-        else
-            local new_tag="anytls-in-${new_tag_suffix}"
+    # [修复] 3. 全局同步更新 metadata.json 中的链接端口与备注名
+    if [ -f "$METADATA_FILE" ]; then
+        if jq -e ".\"$tag_to_modify\"" "$METADATA_FILE" >/dev/null 2>&1; then
+            # [关键修复] _view_nodes 优先读取的是 .share_link 字段 (非 .link)
+            local current_link=$(jq -r ".\"$tag_to_modify\".share_link // \"\"" "$METADATA_FILE")
+            if [ -n "$current_link" ]; then
+                # 全局替换：同时修正 URL 端口和备注名中的端口数字
+                local new_link=$(echo "$current_link" | sed "s/${old_port}/${new_port}/g")
+                _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".share_link = \"$new_link\""
+                _info "分享链接已同步更新。"
+            fi
         fi
-        
-        local new_cert="${SINGBOX_DIR}/${new_tag}.pem"
-        local new_key="${SINGBOX_DIR}/${new_tag}.key"
-        
-        # 重命名证书文件
-        if [ -f "$old_cert" ] && [ -f "$old_key" ]; then
-            mv "$old_cert" "$new_cert"
-            mv "$old_key" "$new_key"
+    fi
+
+    # 4. 通用 tag 重命名（所有含端口的 tag 都可能需要更新）
+    local new_tag=$(echo "$tag_to_modify" | sed "s/${old_port}/${new_port}/g")
+    if [ "$new_tag" != "$tag_to_modify" ]; then
+        # 4a. 处理证书文件重命名（仅 Hysteria2, TUIC, AnyTLS 有独立证书）
+        if [ "$type_to_modify" == "hysteria2" ] || [ "$type_to_modify" == "tuic" ] || [ "$type_to_modify" == "anytls" ]; then
+            local old_cert="${SINGBOX_DIR}/${tag_to_modify}.pem"
+            local old_key="${SINGBOX_DIR}/${tag_to_modify}.key"
+            local new_cert="${SINGBOX_DIR}/${new_tag}.pem"
+            local new_key="${SINGBOX_DIR}/${new_tag}.key"
             
-            # 更新配置中的证书路径
-            _atomic_modify_json "$CONFIG_FILE" ".inbounds[$index].tls.certificate_path = \"$new_cert\"" || return
-            _atomic_modify_json "$CONFIG_FILE" ".inbounds[$index].tls.key_path = \"$new_key\"" || return
+            if [ -f "$old_cert" ] && [ -f "$old_key" ]; then
+                mv "$old_cert" "$new_cert"
+                mv "$old_key" "$new_key"
+                _atomic_modify_json "$CONFIG_FILE" ".inbounds[$index].tls.certificate_path = \"$new_cert\"" || return
+                _atomic_modify_json "$CONFIG_FILE" ".inbounds[$index].tls.key_path = \"$new_key\"" || return
+            fi
         fi
         
-        # 更新 tag
+        # 4b. 更新 config.json 中的 tag
         _atomic_modify_json "$CONFIG_FILE" ".inbounds[$index].tag = \"$new_tag\"" || return
         
-        # 更新 metadata.json 中的 key
-        if jq -e ".\"$tag_to_modify\"" "$METADATA_FILE" >/dev/null 2>&1; then
+        # 4c. 迁移 metadata.json 中的 key (旧tag -> 新tag)
+        if [ -f "$METADATA_FILE" ] && jq -e ".\"$tag_to_modify\"" "$METADATA_FILE" >/dev/null 2>&1; then
             local meta_content=$(jq ".\"$tag_to_modify\"" "$METADATA_FILE")
             _atomic_modify_json "$METADATA_FILE" "del(.\"$tag_to_modify\") | . + {\"$new_tag\": $meta_content}" || return
         fi
+        
+        _info "Tag 同步: ${tag_to_modify} -> ${new_tag}"
     fi
     
     _success "端口修改成功: ${old_port} -> ${new_port}"

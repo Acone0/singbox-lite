@@ -1032,28 +1032,49 @@ _modify_relay_port() {
     _info "正在修改端口..."
     _atomic_modify_json "$CONFIG_FILE" "(.inbounds[] | select(.tag == \"$in_tag\") | .listen_port) = ($new_port|tonumber)"
     
-    # links 记录（简化处理，仅更新内存ID，不重做证书文件名以免复杂）
-    # 但 Hysteria/TUIC 证书文件名含 tag，tag 含 old_port，这比较麻烦。
-    # 为保证稳定性，建议用户删除重建，但此处尽力修复：
-    _info "端口修改已提交 (注: 证书文件名未变更，不影响使用)"
-    
-    # 3. 同步更新 YAML 配置文件中的端口
+    # [修复] 3. 同步更新 relay_links.json 中的链接端口与节点说明
     local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
-    local YQ_BINARY="/usr/local/bin/yq"
+    local old_node_name=""
+    local new_node_name=""
+    if [ -f "$LINKS_FILE" ]; then
+        if jq -e ".\"$in_tag\"" "$LINKS_FILE" >/dev/null 2>&1; then
+            old_node_name=$(jq -r ".\"$in_tag\".node_name // \"\"" "$LINKS_FILE")
+            local current_link=$(jq -r ".\"$in_tag\".link // \"\"" "$LINKS_FILE")
+            
+            # 生成新节点说明名字 (替换端口数字)
+            new_node_name=$(echo "$old_node_name" | sed "s/${old_port}/${new_port}/g")
+            
+            # 1. 链接备注与端口同步
+            if [ -n "$current_link" ]; then
+                local new_link=$(echo "$current_link" | sed "s/${old_port}/${new_port}/g")
+                _atomic_modify_json "$LINKS_FILE" ".\"$in_tag\".link = \"$new_link\""
+            fi
+            
+            # 2. 节点说明同步
+            if [ -n "$new_node_name" ]; then
+                _atomic_modify_json "$LINKS_FILE" ".\"$in_tag\".node_name = \"$new_node_name\""
+            fi
+        fi
+    fi
     
-    if [ -f "$RELAY_CLASH_YAML" ] && [ -f "$YQ_BINARY" ]; then
-        # 从链接文件获取节点名称
-        local node_name_yaml=""
-        if [ -f "$LINKS_FILE" ]; then
-            node_name_yaml=$(jq -r --arg tag "$in_tag" '.[$tag].node_name // empty' "$LINKS_FILE")
-        fi
+    _info "端口修改已提交，链接元数据已同步更新。"
+    
+    # 4. 同步更新 YAML 配置文件中的节点名与端口
+    local YQ_BINARY="/usr/local/bin/yq"
+    if [ -f "$RELAY_CLASH_YAML" ] && [ -f "$YQ_BINARY" ] && [ -n "$old_node_name" ]; then
+        _info "正在同步更新 YAML 节点全链路信息..."
+        export OLD_RELAY_NAME="$old_node_name"
+        export NEW_RELAY_NAME="$new_node_name"
+        export NEW_RELAY_PORT="$new_port"
         
-        # 如果找到了节点名称，更新 YAML 中的端口
-        if [ -n "$node_name_yaml" ]; then
-            _info "正在同步更新 YAML 配置中的端口..."
-            RELAY_NODE_NAME="$node_name_yaml" ${YQ_BINARY} eval '(.proxies[] | select(.name == env(RELAY_NODE_NAME)) | .port) = '${new_port} -i "$RELAY_CLASH_YAML"
-            _success "YAML 配置已同步更新"
-        fi
+        # 1. 改名
+        ${YQ_BINARY} eval '(.proxies[] | select(.name == env(OLD_RELAY_NAME)) | .name) = env(NEW_RELAY_NAME)' -i "$RELAY_CLASH_YAML"
+        # 2. 改端口
+        ${YQ_BINARY} eval '(.proxies[] | select(.name == env(NEW_RELAY_NAME)) | .port) = (env(NEW_RELAY_PORT)|tonumber)' -i "$RELAY_CLASH_YAML"
+        # 3. 更新所有分组中的引用
+        ${YQ_BINARY} eval '(.proxy-groups[].proxies[] | select(. == env(OLD_RELAY_NAME))) = env(NEW_RELAY_NAME)' -i "$RELAY_CLASH_YAML"
+        
+        _success "YAML 节点名同步完成: ${old_node_name} -> ${new_node_name}"
     fi
 
     # 记录操作
