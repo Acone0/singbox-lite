@@ -16,6 +16,7 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
+ORANGE='\033[0;33m'
 
 # 打印消息函数
 _info() { echo -e "${CYAN}[信息] $1${NC}" >&2; }
@@ -38,17 +39,9 @@ _url_decode() {
     printf '%b' "${data//%/\\x}"
 }
 _url_encode() {
-    local string="${1}"
-    local length="${#string}"
-    local res=""
-    for (( i = 0; i < length; i++ )); do
-        local c="${string:i:1}"
-        case "$c" in
-            [a-zA-Z0-9.~_-]) res+="$c" ;;
-            *) printf -v res "%s%%%02X" "$res" "'$c" ;;
-        esac
-    done
-    echo "$res"
+    # [修复] 使用 jq 内建 @uri 过滤器，完美处理 UTF-8 多字节字符
+    # jq 是必装依赖，@uri 以字节为单位执行标准 percent-encoding
+    printf '%s' "$1" | jq -sRr @uri
 }
 
 # 公网 IP 获取 (带全局缓存)
@@ -56,6 +49,7 @@ _get_public_ip() {
     [ -n "$server_ip" ] && [ "$server_ip" != "null" ] && { echo "$server_ip"; return; }
     local ip=$(timeout 5 curl -s4 --max-time 2 icanhazip.com 2>/dev/null || timeout 5 curl -s4 --max-time 2 ipinfo.io/ip 2>/dev/null)
     [ -z "$ip" ] && ip=$(timeout 5 curl -s6 --max-time 2 icanhazip.com 2>/dev/null || timeout 5 curl -s6 --max-time 2 ipinfo.io/ip 2>/dev/null)
+    server_ip="$ip"
     echo "$ip"
 }
 _get_ip() { _get_public_ip; } # 别名兼容
@@ -194,7 +188,11 @@ _sync_system_time() {
         # 最后的屏障：通过 HTTP 头部修正时间 (防御 UDP 123 拦截)
         local http_time=$(curl -sI --max-time 3 https://www.google.com | grep -i '^date:' | cut -f2- -d' ')
         if [ -n "$http_time" ]; then
-            date -s "$http_time" >/dev/null 2>&1
+            # [修复] 先尝试 GNU date 直接设置，失败后尝试 epoch 方式 (兼容 BusyBox)
+            if ! date -s "$http_time" >/dev/null 2>&1; then
+                local epoch=$(date -d "$http_time" +%s 2>/dev/null)
+                [ -n "$epoch" ] && date -s "@$epoch" >/dev/null 2>&1
+            fi
         fi
     fi
     _info "当前时间：$(date)"
@@ -280,6 +278,14 @@ _install_dependencies() {
     _info "正在进行全家桶式依赖预装 (Master Installer Strategy)..."
     _pkg_install $pkgs
     _install_yq
+
+    # [修复] Alpine 上 dcron 安装后需手动启动 cron 守护进程
+    if command -v apk &>/dev/null; then
+        if command -v crond &>/dev/null; then
+            rc-service dcron start 2>/dev/null
+            rc-update add dcron default 2>/dev/null
+        fi
+    fi
 }
 
 # 确保 iptables 已安装
@@ -812,7 +818,7 @@ _view_argo_nodes() {
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
              state="${GREEN}运行中${NC} (PID: $pid)"
              # 如果是临时的，尝试从 log 读最新域名
-             if [ "$type" == "temp" ] || [ -z "$domain" ] || [ "$domain" == "null" ]; then
+             if [ "$argo_type" == "temp" ] || [ -z "$domain" ] || [ "$domain" == "null" ]; then
                   local log_file="/tmp/singbox_argo_${port}.log"
                   local temp_domain=$(grep -o 'https://[a-zA-Z0-9-]*\.trycloudflare\.com' "$log_file" 2>/dev/null | tail -1 | sed 's|https://||')
                    [ -n "$temp_domain" ] && domain="$temp_domain"
@@ -1201,10 +1207,11 @@ _uninstall_argo() {
         for tag in $tags; do
              if [ -n "$tag" ]; then
                 _info "正在删除 Argo 隧道: $tag ..."
+                # [修复] 先读取节点名，再删除元数据
+                local node_name=$(jq -r ".\"$tag\".name" "$ARGO_METADATA_FILE" 2>/dev/null)
     _atomic_modify_json "$ARGO_METADATA_FILE" "del(.\""$tag"\")" 2>/dev/null
     _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag\"))"
                 
-                local node_name=$(jq -r ".\"$tag\".name" "$ARGO_METADATA_FILE" 2>/dev/null)
                 if [ -n "$node_name" ] && [ "$node_name" != "null" ]; then
                     _remove_node_from_yaml "$node_name"
                 fi
@@ -2320,10 +2327,7 @@ _add_anytls() {
     _add_node_to_yaml "$proxy_json"
     
     # --- 保存元数据 ---
-    local meta_json=$(jq -n \
-        --arg sn "$server_name" \
-        '{server_name: $sn}')
-    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": $meta_json}" || return 1
+    _atomic_modify_json "$METADATA_FILE" ". + {\"$tag\": {\"server_name\": \"$server_name\"}}" || return 1
     
     # --- 生成分享链接 ---
     local insecure_param=""
@@ -2641,11 +2645,11 @@ _add_tuic() {
         '{"type":"tuic","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"password":$pw}],"congestion_control":"bbr","tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
     
-    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$camouflage_domain" \
+    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sn "$server_name" \
         '{"name":$n,"type":"tuic","server":$s,"port":($p|tonumber),"uuid":$u,"password":$pw,"sni":$sn,"skip-cert-verify":true,"alpn":["h3"],"udp-relay-mode":"native","congestion-controller":"bbr"}')
     _add_node_to_yaml "$proxy_json"
     _success "TUICv5 节点 [${name}] 添加成功!"
-    _show_node_link "tuic" "$name" "$link_ip" "$port" "$tag" "$uuid" "$password" "$camouflage_domain"
+    _show_node_link "tuic" "$name" "$link_ip" "$port" "$tag" "$uuid" "$password" "$server_name"
 }
 
 _add_shadowsocks_menu() {
@@ -2990,7 +2994,7 @@ _view_nodes() {
         if [[ "$gen_base64" == "y" || "$gen_base64" == "Y" ]]; then
             echo ""
             _info "=== 聚合 Base64 订阅 ==="
-            local base64_result=$(cat /tmp/singbox_links.tmp | base64 -w 0)
+            local base64_result=$(cat /tmp/singbox_links.tmp | base64 | tr -d '\n')
             echo -e "${CYAN}${base64_result}${NC}"
             echo ""
             _success "可直接复制上方内容导入 v2rayN 等客户端"
@@ -3640,7 +3644,7 @@ _main_menu() {
     echo -e "    与北京时间: ${YELLOW}${diff_display}${NC}"
     echo ""
     echo -e "  ${CYAN}【定时重启状态】${NC}"
-    if [ -n "$current_cron" ]; then
+    if [ "$cron_status" != "未设置" ]; then
         echo -e "    状态: ${GREEN}${cron_status}${NC}"
     else
         echo -e "    状态: ${YELLOW}${cron_status}${NC}"
@@ -3807,7 +3811,7 @@ _quick_deploy() {
     # 生成3个不重复的随机端口
     local ports=()
     while [ ${#ports[@]} -lt 3 ]; do
-        local p=$(shuf -i 10000-60000 -n 1)
+        local p=$(( RANDOM % 50001 + 10000 ))
         # 确保端口不重复
         local duplicate=false
         for existing in "${ports[@]}"; do
@@ -3923,7 +3927,7 @@ _quick_deploy() {
     for link in "${links[@]}"; do
         all_links+="${link}\n"
     done
-    local base64_sub=$(echo -e "$all_links" | base64 -w 0)
+    local base64_sub=$(echo -e "$all_links" | base64 | tr -d '\n')
     
     # 输出节点信息
     echo ""

@@ -4,6 +4,7 @@
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
 SINGBOX_BIN="/usr/local/bin/sing-box"
+GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
 
 # [整合方案] 检测父进程导出的工具函数
 # 如果独立运行且函数缺失，可在此定义最简兜底逻辑 (可选)
@@ -13,6 +14,12 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
+
+# 核心工具函数
+_url_encode() {
+    # [修复] 使用 jq 内建 @uri 过滤器，完美处理 UTF-8 多字节字符
+    printf '%s' "$1" | jq -sRr @uri
+}
 
 # 打印消息函数 (强制重定向到 stderr，防止干扰变量捕获)
 if ! declare -f _info >/dev/null; then
@@ -24,7 +31,6 @@ fi
 
 # --- 全局变量 ---
 # 工具路径
-SINGBOX_BIN="/usr/local/bin/sing-box"
 YQ_BINARY="/usr/local/bin/yq"
 
 # 配置文件路径
@@ -33,6 +39,17 @@ MAIN_METADATA_FILE="${SINGBOX_DIR}/metadata.json"
 RELAY_AUX_DIR="${SINGBOX_DIR}"
 RELAY_CLASH_YAML="${RELAY_AUX_DIR}/clash.yaml"
 RELAY_CONFIG_FILE="${RELAY_AUX_DIR}/relay.json"
+
+# [修复] 独立定义 _install_yq，确保子脚本可独立运行
+_install_yq() {
+    if ! command -v yq &>/dev/null; then
+        _info "安装 yq..."
+        local arch=$(uname -m)
+        case $arch in x86_64|amd64) arch='amd64' ;; aarch64|arm64) arch='arm64' ;; *) arch='amd64' ;; esac
+        wget -qO "$YQ_BINARY" "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_$arch"
+        chmod +x "$YQ_BINARY"
+    fi
+}
 
 # 核心环境检测
 _detect_init_system() {
@@ -301,15 +318,14 @@ _import_link_config() {
 
 # 检查依赖 (主脚本已预装绝大部分，此处仅做快速校验)
 _check_deps() {
-    local missing=()
+    # [修复] 移除 Bash 数组语法，防止在部分环境（如 Ash/Dash）下闪退
     for cmd in jq openssl wget curl yq; do
-        if ! command -v $cmd &>/dev/null; then missing+=($cmd); fi
+        if ! command -v $cmd &>/dev/null; then
+            _error "缺少关键依赖: $cmd"
+            _warn "请先运行主脚本 [1) 安装环境]。"
+            exit 1
+        fi
     done
-    
-    if [ ${#missing[@]} -ne 0 ]; then
-        _error "缺少关键依赖: ${missing[*]}. 请先运行主脚本 [1) 安装环境]。"
-        exit 1
-    fi
 }
 
 # --- 1. 落地机配置 (生成 Token) ---
@@ -607,7 +623,7 @@ _finalize_relay_setup() {
     # --- 配置入口详细信息 ---
     while true; do
         read -p "  请输入本机监听端口 (回车随机): " listen_port
-        [[ -z "$listen_port" ]] && listen_port=$(shuf -i 10000-50000 -n 1)
+        [[ -z "$listen_port" ]] && listen_port=$(( RANDOM % 40001 + 10000 ))
         
         if _check_port_occupied "$listen_port"; then
             _error "端口 $listen_port 已被系统占用，请重新输入！"
@@ -664,7 +680,7 @@ _finalize_relay_setup() {
             '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":$f}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
              
         local server_ip=$(_get_public_ip)
-        link="vless://${uuid}@${server_ip}:${listen_port}?encryption=none&flow=${flow}&security=reality&sni=${entrance_sni}&fp=chrome&pbk=${pbk}&sid=${sid}&type=tcp#${node_name}"
+        link="vless://${uuid}@${server_ip}:${listen_port}?encryption=none&flow=${flow}&security=reality&sni=${entrance_sni}&fp=chrome&pbk=${pbk}&sid=${sid}&type=tcp#$(_url_encode "${node_name}")"
         
     elif [ "$relay_type" == "hysteria2" ]; then
         local password=$($SINGBOX_BIN generate rand --hex 16)
@@ -673,7 +689,7 @@ _finalize_relay_setup() {
             '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
 
         local server_ip=$(_get_public_ip)
-        link="hysteria2://${password}@${server_ip}:${listen_port}?sni=${entrance_sni}&insecure=1&up=10000&down=10000#${node_name}"
+        link="hysteria2://${password}@${server_ip}:${listen_port}?sni=${entrance_sni}&insecure=1&up=10000&down=10000#$(_url_encode "${node_name}")"
         
     elif [ "$relay_type" == "tuic" ]; then
         local uuid=$($SINGBOX_BIN generate uuid)
@@ -682,7 +698,7 @@ _finalize_relay_setup() {
             '{"type":"tuic","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"password":$pw}],"congestion_control":"bbr","tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
             
         local server_ip=$(_get_public_ip)
-        link="tuic://${uuid}:${password}@${server_ip}:${listen_port}?sni=${entrance_sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#${node_name}"
+        link="tuic://${uuid}:${password}@${server_ip}:${listen_port}?sni=${entrance_sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "${node_name}")"
         
     elif [ "$relay_type" == "anytls" ]; then
         local password=$($SINGBOX_BIN generate uuid)
@@ -690,7 +706,7 @@ _finalize_relay_setup() {
             '{"type":"anytls","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"name":"default","password":$pw}],"padding_scheme":["stop=2","0=100-200","1=100-200"],"tls":{"enabled":true,"server_name":$sn,"certificate_path":$cert,"key_path":$key}}')
             
         local server_ip=$(_get_public_ip)
-        link="anytls://${password}@${server_ip}:${listen_port}?security=tls&sni=${entrance_sni}&insecure=1&allowInsecure=1&type=tcp#${node_name}"
+        link="anytls://${password}@${server_ip}:${listen_port}?security=tls&sni=${entrance_sni}&insecure=1&allowInsecure=1&type=tcp#$(_url_encode "${node_name}")"
     fi
     
     # 2. 写入配置到主配置文件
@@ -769,8 +785,8 @@ _finalize_relay_setup() {
     _success "中转配置已生效！"
     echo -e "  节点名称: ${GREEN}$node_name${NC}"
     echo -e "  中转协议: ${CYAN}$relay_type${NC}"
-    echo -e "  落地地址: ${CYAN}$landing_info${NC}"
-    echo -e "  本地监听: ${WHITE}$listen_port${NC}"
+    echo -e "  落地地址: ${CYAN}${dest_addr}:${dest_port}${NC}"
+    echo -e "  本地监听: ${CYAN}$listen_port${NC}"
     echo -e "分享链接:"
     echo -e "${CYAN}$link${NC}"
     echo -e "${YELLOW}═════════════════════════════════════════════════${NC}"
@@ -786,8 +802,10 @@ _relay_config() {
     
     if [ -z "$token_input" ]; then _error "输入为空。"; return; fi
     
-    local decoded_json=$(echo "$token_input" | base64 -d 2>/dev/null)
-    if [ $? -ne 0 ] || ! echo "$decoded_json" | jq . >/dev/null 2>&1; then
+    local decoded_json
+    decoded_json=$(echo "$token_input" | base64 -d 2>/dev/null)
+    local decode_status=$?
+    if [ $decode_status -ne 0 ] || [ -z "$decoded_json" ] || ! echo "$decoded_json" | jq . >/dev/null 2>&1; then
         _error "Token 无效或无法解码！"
         return
     fi

@@ -169,7 +169,7 @@ _parse_hy2() {
 # 解析 TUIC
 _parse_tuic() {
     local link="$1"
-    local regex="tuic://([^:]+):([^@]+)@([^:/?#]+):([0-9]+)\\??([^#]*)#?(.*)"
+    local regex="tuic://([^:]+):([^@]+)@([^:/?#]+):([0-9]+)\??([^#]*)#?(.*)"
     if [[ $link =~ $regex ]]; then
         local uuid="${BASH_REMATCH[1]}"
         local password=$(_decode "${BASH_REMATCH[2]}")
@@ -188,7 +188,7 @@ _parse_tuic() {
 # 解析 AnyTLS
 _parse_anytls() {
     local link="$1"
-    local regex="anytls://([^@]+)@([^:/?#]+):([0-9]+)\\??([^#]*)#?(.*)"
+    local regex="anytls://([^@]+)@([^:/?#]+):([0-9]+)\??([^#]*)#?(.*)"
     if [[ $link =~ $regex ]]; then
         local password=$(_decode "${BASH_REMATCH[1]}")
         local server="${BASH_REMATCH[2]}"
@@ -212,7 +212,7 @@ _parse_socks() {
         local port="${BASH_REMATCH[4]}"
         
         jq -n --arg s "$server" --argjson p "$port" --arg u "$user" --arg pw "$pass" \
-            '{type:"socks", tag:"proxy", server:$s, server_port:$p, version:"5", users:[{username:$u, password:$pass}]}'
+            '{type:"socks", tag:"proxy", server:$s, server_port:$p, version:"5", users:[{username:$u, password:$pw}]}'
     fi
 }
 
