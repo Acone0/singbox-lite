@@ -125,7 +125,7 @@
 进入交互菜单手动配置节点：
 
 ```
-(curl -LfsS https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
+(curl -LfsS https://raw.githubusercontent.com/Acone0/singbox-lite/refs/heads/main/singbox.sh -o /usr/local/bin/sb || wget -q https://raw.githubusercontent.com/Acone0/singbox-lite/refs/heads/main/singbox.sh -O /usr/local/bin/sb) && chmod +x /usr/local/bin/sb && sb
 ```
 
 **快捷命令：sb**
@@ -135,7 +135,7 @@
 一条命令自动部署 VLESS-Reality、Hysteria2、TUICv5 三节点，适用于实例初始化：
 
 ```
-(curl -sSL https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh -o /usr/local/bin/sb || wget -qO /usr/local/bin/sb https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main/singbox.sh) && chmod +x /usr/local/bin/sb && sb -q
+(curl -sSL https://raw.githubusercontent.com/Acone0/singbox-lite/refs/heads/main/singbox.sh -o /usr/local/bin/sb || wget -qO /usr/local/bin/sb https://raw.githubusercontent.com/Acone0/singbox-lite/refs/heads/main/singbox.sh) && chmod +x /usr/local/bin/sb && sb -q
 ```
 
 **特点**：
