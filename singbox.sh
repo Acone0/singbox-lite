@@ -9,6 +9,11 @@ SINGBOX_DIR="/usr/local/etc/sing-box"
 GITHUB_RAW_BASE="https://raw.githubusercontent.com/0xdabiaoge/singbox-lite/main"
 SCRIPT_UPDATE_URL="${GITHUB_RAW_BASE}/singbox.sh"
 
+# 注入 sing-box 1.12+ 废弃配置兼容环境变量 (用于脚本内嵌的前台命令调用，如 check/generate)
+export ENABLE_DEPRECATED_LEGACY_DNS_SERVERS="true"
+export ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM="true"
+export ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER="true"
+
 # --- 核心工具函数 ---
 
 # 颜色定义
@@ -1350,6 +1355,8 @@ After=network.target nss-lookup.target
 [Service]
 Environment="GOMEMLIMIT=${mem_limit_mb}MiB"
 Environment="ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true"
+Environment="ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true"
+Environment="ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
 ExecStart=${SINGBOX_BIN} run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json
 Restart=on-failure
 RestartSec=3s
@@ -1373,7 +1380,7 @@ command="${SINGBOX_BIN}"
 command_args="run -c ${CONFIG_FILE} -c ${SINGBOX_DIR}/relay.json"
 # 使用 supervise-daemon 实现守护和重启
 supervisor="supervise-daemon"
-supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true"
+supervise_daemon_args="--env GOMEMLIMIT=${mem_limit_mb}MiB --env ENABLE_DEPRECATED_LEGACY_DNS_SERVERS=true --env ENABLE_DEPRECATED_OUTBOUND_DNS_RULE_ITEM=true --env ENABLE_DEPRECATED_MISSING_DOMAIN_RESOLVER=true"
 respawn_delay=3
 respawn_max=0
 
@@ -3269,7 +3276,9 @@ _delete_node() {
 
 _check_config() {
     _info "正在检查 sing-box 配置文件..."
-    local result=$(${SINGBOX_BIN} check -c ${CONFIG_FILE})
+    # 捕获所有输出（包括 stderr 产生的大量 WARN 和 TRACE 弃用警告）
+    local result
+    result=$(${SINGBOX_BIN} check -c ${CONFIG_FILE} 2>&1)
     if [[ $? -eq 0 ]]; then
         _success "配置文件 (${CONFIG_FILE}) 格式正确。"
     else
@@ -3680,20 +3689,26 @@ _main_menu() {
         fi
         [ -z "$os_info" ] && os_info=$(uname -s)
         
-        # 获取服务状态
+        # 获取 Sing-box 版本和状态
+        local sb_version=""
         local service_status="○ 未知"
-        if [ "$INIT_SYSTEM" == "systemd" ]; then
-            if systemctl is-active --quiet sing-box 2>/dev/null; then
-                service_status="${GREEN}● 运行中${NC}"
-            else
-                service_status="${RED}○ 已停止${NC}"
+        if [ -f "$SINGBOX_BIN" ]; then
+            sb_version=" v$($SINGBOX_BIN version 2>/dev/null | head -n1 | awk '{print $3}')"
+            if [ "$INIT_SYSTEM" == "systemd" ]; then
+                if systemctl is-active --quiet sing-box 2>/dev/null; then
+                    service_status="${GREEN}● 运行中${NC}"
+                else
+                    service_status="${RED}○ 已停止${NC}"
+                fi
+            elif [ "$INIT_SYSTEM" == "openrc" ]; then
+                if rc-service sing-box status 2>/dev/null | grep -q "started"; then
+                    service_status="${GREEN}● 运行中${NC}"
+                else
+                    service_status="${RED}○ 已停止${NC}"
+                fi
             fi
-        elif [ "$INIT_SYSTEM" == "openrc" ]; then
-            if rc-service sing-box status 2>/dev/null | grep -q "started"; then
-                service_status="${GREEN}● 运行中${NC}"
-            else
-                service_status="${RED}○ 已停止${NC}"
-            fi
+        else
+            service_status="${RED}○ 未安装${NC}"
         fi
         
         # 获取 Argo 状态 (优化检测逻辑：使用 ps 过滤，兼容 busybox/alpine)
@@ -3707,9 +3722,11 @@ _main_menu() {
             fi
         fi
         
-        # 获取 Xray 状态
+        # 获取 Xray 版本和状态
+        local xray_version=""
         local xray_status="${RED}○ 未安装${NC}"
         if [ -f "/usr/local/bin/xray" ]; then
+            xray_version=" v$(/usr/local/bin/xray version 2>/dev/null | head -1 | awk '{print $2}')"
             if [ "$INIT_SYSTEM" == "systemd" ]; then
                 if systemctl is-active --quiet xray 2>/dev/null; then
                     xray_status="${GREEN}● 运行中${NC}"
@@ -3728,8 +3745,8 @@ _main_menu() {
         fi
         
         echo -e "  系统: ${CYAN}${os_info}${NC}  |  模式: ${CYAN}${INIT_SYSTEM}${NC}"
-        echo -e "  Sing-box: ${service_status}  |  Argo: ${argo_status}"
-        echo -e "  Xray: ${xray_status}"
+        echo -e "  Sing-box${CYAN}${sb_version}${NC}: ${service_status}  |  Argo: ${argo_status}"
+        echo -e "  Xray${CYAN}${xray_version}${NC}: ${xray_status}"
         echo ""
         
         # 节点管理
