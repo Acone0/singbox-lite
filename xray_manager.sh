@@ -3,7 +3,7 @@
 # xray_manager.sh — Xray-core 节点管理子脚本
 # 与 singbox.sh 共存，共享 clash.yaml
 # ============================================================
-XRAY_SCRIPT_VERSION="1.0.0"
+XRAY_SCRIPT_VERSION="2.0.0"
 SCRIPT_DIR="$(dirname "$(readlink -f "$0")")"
 
 # --- 路径定义 ---
@@ -43,8 +43,9 @@ fi
 # --- 环境检测 ---
 if ! declare -f _detect_init_system >/dev/null 2>&1; then
     _detect_init_system() {
-        if [ -f /etc/openrc/rc.conf ]; then INIT_SYSTEM="openrc"
-        else INIT_SYSTEM="systemd"; fi
+        if [ -f /sbin/openrc-run ] || command -v rc-service &>/dev/null; then INIT_SYSTEM="openrc"
+        elif command -v systemctl &>/dev/null; then INIT_SYSTEM="systemd"
+        else INIT_SYSTEM="unknown"; fi
     }
 fi
 [ -z "$INIT_SYSTEM" ] && _detect_init_system
@@ -190,7 +191,9 @@ _install_xray() {
         *)             xray_arch="64" ;;
     esac
     
-    local download_url="https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-${xray_arch}.zip"
+    local zip_name="Xray-linux-${xray_arch}.zip"
+    local download_url="https://github.com/XTLS/Xray-core/releases/latest/download/${zip_name}"
+    local dgst_url="${download_url}.dgst"
     local tmp_dir=$(mktemp -d)
     local tmp_zip="${tmp_dir}/xray.zip"
     
@@ -199,6 +202,28 @@ _install_xray() {
         _error "Xray 下载失败！"
         rm -rf "$tmp_dir"
         return 1
+    fi
+    
+    # SHA256 完整性校验
+    local dgst_content=$(wget -qO- "$dgst_url" 2>/dev/null)
+    if [ -n "$dgst_content" ]; then
+        _info "正在进行 SHA256 完整性校验..."
+        local expected_hash=$(echo "$dgst_content" | grep "SHA2-256" | head -1 | awk -F'= ' '{print $2}' | tr -d '[:space:]')
+        if [ -n "$expected_hash" ]; then
+            local actual_hash=$(sha256sum "$tmp_zip" | awk '{print $1}')
+            if [ "${expected_hash,,}" != "${actual_hash,,}" ]; then
+                _error "SHA256 校验失败！文件可能已被篡改。"
+                _error "预期: ${expected_hash}"
+                _error "实际: ${actual_hash}"
+                rm -rf "$tmp_dir"
+                return 1
+            fi
+            _success "SHA256 校验通过。"
+        else
+            _warn "校验文件格式异常，跳过校验。"
+        fi
+    else
+        _warn "未找到校验文件，跳过完整性校验。"
     fi
     
     if ! unzip -qo "$tmp_zip" -d "$tmp_dir"; then
@@ -452,9 +477,9 @@ _add_vless_reality_vision() {
     node_ip=${custom_ip:-$server_ip}
     
     local port=$(_input_port)
-    local sni="www.apple.com"
-    read -p "请输入伪装域名 SNI (默认: www.apple.com): " custom_sni
-    sni=${custom_sni:-www.apple.com}
+    local sni="www.amd.com"
+    read -p "请输入伪装域名 SNI (默认: www.amd.com): " custom_sni
+    sni=${custom_sni:-www.amd.com}
     
     local default_name="X-Reality-${port}"
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
@@ -515,9 +540,9 @@ _add_vless_grpc_reality() {
     node_ip=${custom_ip:-$server_ip}
     
     local port=$(_input_port)
-    local sni="www.apple.com"
-    read -p "请输入伪装域名 SNI (默认: www.apple.com): " custom_sni
-    sni=${custom_sni:-www.apple.com}
+    local sni="www.amd.com"
+    read -p "请输入伪装域名 SNI (默认: www.amd.com): " custom_sni
+    sni=${custom_sni:-www.amd.com}
     
     local service_name="grpc"
     read -p "请输入 gRPC serviceName (默认: grpc): " custom_svc
@@ -571,9 +596,9 @@ _add_trojan_xhttp_reality() {
     node_ip=${custom_ip:-$server_ip}
     
     local port=$(_input_port)
-    local sni="www.apple.com"
-    read -p "请输入伪装域名 SNI (默认: www.apple.com): " custom_sni
-    sni=${custom_sni:-www.apple.com}
+    local sni="www.amd.com"
+    read -p "请输入伪装域名 SNI (默认: www.amd.com): " custom_sni
+    sni=${custom_sni:-www.amd.com}
     
     local path="/$(openssl rand -hex 6)"
     read -p "请输入 XHTTP 路径 (默认: ${path}): " custom_path
@@ -622,9 +647,9 @@ _add_trojan_grpc_reality() {
     node_ip=${custom_ip:-$server_ip}
     
     local port=$(_input_port)
-    local sni="www.apple.com"
-    read -p "请输入伪装域名 SNI (默认: www.apple.com): " custom_sni
-    sni=${custom_sni:-www.apple.com}
+    local sni="www.amd.com"
+    read -p "请输入伪装域名 SNI (默认: www.amd.com): " custom_sni
+    sni=${custom_sni:-www.amd.com}
     
     local service_name="trojan-grpc"
     read -p "请输入 gRPC serviceName (默认: trojan-grpc): " custom_svc
@@ -678,18 +703,40 @@ _add_shadowsocks_xray() {
     echo "========================================"
     _info "      Xray Shadowsocks 加密方式"
     echo "========================================"
-    echo " 1) chacha20-ietf-poly1305 (推荐)"
-    echo " 2) aes-128-gcm"
-    echo " 3) aes-256-gcm"
+    echo " [经典 SS]"
+    echo " 1) aes-256-gcm"
+    echo " 2) chacha20-ietf-poly1305"
+    echo " [SS-2022 (强抗重放保护)]"
+    echo " 3) 2022-blake3-aes-256-gcm"
+    echo " 4) 2022-blake3-aes-256-gcm (带 Padding)"
     echo " 0) 返回"
     echo "========================================"
-    read -p "请选择 [0-3]: " choice
+    read -p "请选择 [0-4]: " choice
     
-    local method=""
+    local method="" password="" name_prefix="" use_multiplex="false"
     case $choice in
-        1) method="chacha20-ietf-poly1305" ;;
-        2) method="aes-128-gcm" ;;
-        3) method="aes-256-gcm" ;;
+        1) 
+            method="aes-256-gcm"
+            password=$(openssl rand -hex 16)
+            name_prefix="X-SS-aes256"
+            ;;
+        2) 
+            method="chacha20-ietf-poly1305"
+            password=$(openssl rand -hex 16)
+            name_prefix="X-SS-chacha20"
+            ;;
+        3) 
+            method="2022-blake3-aes-256-gcm"
+            password=$(openssl rand -base64 32)
+            name_prefix="X-SS-2022"
+            ;;
+        4) 
+            method="2022-blake3-aes-256-gcm"
+            password=$(openssl rand -base64 32)
+            name_prefix="X-SS-2022-Padding"
+            use_multiplex="true"
+            _info "已配置 Multiplex + Padding 选项"
+            ;;
         0) return 1 ;;
         *) _error "无效输入"; return 1 ;;
     esac
@@ -699,19 +746,19 @@ _add_shadowsocks_xray() {
     
     local port=$(_input_port)
     
-    local default_name="X-SS-${method}-${port}"
+    local default_name="${name_prefix}-${port}"
     read -p "请输入节点名称 (默认: ${default_name}): " custom_name
     local name=${custom_name:-$default_name}
     
-    local password=$(openssl rand -hex 16)
     local tag="xray-ss-${port}"
     local yaml_ip="$node_ip"
     local link_ip="$node_ip"; [[ "$node_ip" == *":"* ]] && link_ip="[$node_ip]"
     
+    # 修复：listen 监听地址改为 "::" 支持 IPv4+IPv6 双栈
     local inbound=$(jq -n --arg tag "$tag" --argjson port "$port" --arg m "$method" --arg pw "$password" \
         '{
             tag: $tag,
-            listen: "0.0.0.0",
+            listen: "::",
             port: $port,
             protocol: "shadowsocks",
             settings: {
@@ -723,8 +770,14 @@ _add_shadowsocks_xray() {
     
     _atomic_modify_json "$XRAY_CONFIG" ".inbounds += [$inbound]" || return 1
     
-    local proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --argjson p "$port" --arg m "$method" --arg pw "$password" \
-        '{name:$n, type:"ss", server:$s, port:$p, cipher:$m, password:$pw}')
+    local proxy_json=""
+    if [ "$use_multiplex" == "true" ]; then
+        proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --argjson p "$port" --arg m "$method" --arg pw "$password" \
+            '{name:$n, type:"ss", server:$s, port:$p, cipher:$m, password:$pw, smux: {enabled: true, padding: true}}')
+    else
+        proxy_json=$(jq -n --arg n "$name" --arg s "$yaml_ip" --argjson p "$port" --arg m "$method" --arg pw "$password" \
+            '{name:$n, type:"ss", server:$s, port:$p, cipher:$m, password:$pw}')
+    fi
     _add_node_to_yaml "$proxy_json"
     
     local link="ss://$(_url_encode "${method}:${password}")@${link_ip}:${port}#$(_url_encode "$name")"
@@ -738,17 +791,7 @@ _add_shadowsocks_xray() {
 # ============================================================
 #                 自签证书生成 (CF回源用)
 # ============================================================
-
-_generate_xray_cert() {
-    local domain="$1" cert_path="$2" key_path="$3"
-    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
-        -days 3650 -nodes -keyout "$key_path" -out "$cert_path" \
-        -subj "/CN=$domain" 2>/dev/null
-    if [ ! -f "$cert_path" ] || [ ! -f "$key_path" ]; then
-        _error "证书生成失败！"
-        return 1
-    fi
-}
+# 注意: CF回源协议复用上方第160行定义的 _generate_xray_cert，不再重复定义
 
 # ============================================================
 #         6. VLESS + HTTP/2 + TLS (支持CF回源)
@@ -762,9 +805,9 @@ _add_vless_h2_tls() {
     node_ip=${custom_ip:-$server_ip}
     
     local port=$(_input_port)
-    local sni="www.apple.com"
-    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.apple.com): " custom_sni
-    sni=${custom_sni:-www.apple.com}
+    local sni="www.amd.com"
+    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.amd.com): " custom_sni
+    sni=${custom_sni:-www.amd.com}
     
     local path="/$(openssl rand -hex 6)"
     read -p "请输入 H2 路径 (默认: ${path}): " custom_path
@@ -837,9 +880,9 @@ _add_vless_grpc_tls() {
     node_ip=${custom_ip:-$server_ip}
     
     local port=$(_input_port)
-    local sni="www.apple.com"
-    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.apple.com): " custom_sni
-    sni=${custom_sni:-www.apple.com}
+    local sni="www.amd.com"
+    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.amd.com): " custom_sni
+    sni=${custom_sni:-www.amd.com}
     
     local service_name="grpc-$(openssl rand -hex 4)"
     read -p "请输入 gRPC serviceName (默认: ${service_name}): " custom_svc
@@ -912,9 +955,9 @@ _add_trojan_grpc_tls() {
     node_ip=${custom_ip:-$server_ip}
     
     local port=$(_input_port)
-    local sni="www.apple.com"
-    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.apple.com): " custom_sni
-    sni=${custom_sni:-www.apple.com}
+    local sni="www.amd.com"
+    read -p "请输入域名 (CF回源填绑定域名, 直连回车默认: www.amd.com): " custom_sni
+    sni=${custom_sni:-www.amd.com}
     
     local service_name="grpc-$(openssl rand -hex 4)"
     read -p "请输入 gRPC serviceName (默认: ${service_name}): " custom_svc

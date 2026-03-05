@@ -233,11 +233,15 @@ _parse_anytls() {
     fi
 }
 
-# 解析 SOCKS5
+# 解析 SOCKS5 (支持有认证和无认证两种格式)
 _parse_socks() {
     local link="$1"
-    local regex="socks5://([^:]+):([^@]+)@([^:/?#]+):([0-9]+)#?(.*)"
-    if [[ $link =~ $regex ]]; then
+    # 有认证格式: socks5://user:pass@host:port#name
+    local regex_auth="socks5://([^:]+):([^@]+)@([^:/?#]+):([0-9]+)#?(.*)"
+    # 无认证格式: socks5://host:port#name
+    local regex_noauth="socks5://([^:/?#]+):([0-9]+)#?(.*)"
+    
+    if [[ $link =~ $regex_auth ]]; then
         local user="${BASH_REMATCH[1]}"
         local pass="${BASH_REMATCH[2]}"
         local server="${BASH_REMATCH[3]}"
@@ -245,6 +249,12 @@ _parse_socks() {
         
         jq -n --arg s "$server" --argjson p "$port" --arg u "$user" --arg pw "$pass" \
             '{type:"socks", tag:"proxy", server:$s, server_port:$p, version:"5", users:[{username:$u, password:$pw}]}'
+    elif [[ $link =~ $regex_noauth ]]; then
+        local server="${BASH_REMATCH[1]}"
+        local port="${BASH_REMATCH[2]}"
+        
+        jq -n --arg s "$server" --argjson p "$port" \
+            '{type:"socks", tag:"proxy", server:$s, server_port:$p, version:"5"}'
     fi
 }
 

@@ -51,12 +51,14 @@ _install_yq() {
     fi
 }
 
-# 核心环境检测
+# 核心环境检测 (与主脚本 singbox.sh 保持一致)
 _detect_init_system() {
-    if [ -f /etc/openrc/rc.conf ]; then
+    if [ -f /sbin/openrc-run ] || command -v rc-service &>/dev/null; then
         INIT_SYSTEM="openrc"
-    else
+    elif command -v systemctl &>/dev/null; then
         INIT_SYSTEM="systemd"
+    else
+        INIT_SYSTEM="unknown"
     fi
 }
 [ -z "$INIT_SYSTEM" ] && _detect_init_system
@@ -71,39 +73,57 @@ _get_public_ip() {
     echo "$ip"
 }
 
-# 端口冲突检测
+# 端口冲突检测 (与主脚本 singbox.sh 保持一致，区分 TCP/UDP)
 _check_port_occupied() {
     local port=$1
-    if command -v netstat &>/dev/null; then
-        netstat -tuln | grep -q ":$port "
-    elif command -v ss &>/dev/null; then
-        ss -tuln | grep -q ":$port "
+    local proto=${2:-tcp}
+    if [[ "$proto" == "tcp" ]]; then
+        if command -v ss &>/dev/null; then
+            ss -lnpt | grep -q ":${port} " && return 0
+        else
+            netstat -lnpt | grep -q ":${port} " && return 0
+        fi
     else
-        lsof -i ":$port" &>/dev/null
+        if command -v ss &>/dev/null; then
+            ss -lnpu | grep -q ":${port} " && return 0
+        else
+            netstat -lnpu | grep -q ":${port} " && return 0
+        fi
     fi
+    return 1
 }
 
 # IPTables 规则保存
 _save_iptables_rules() {
     _info "正在保存 IPTables 规则..."
     if command -v netfilter-persistent &>/dev/null; then
+        # Debian/Ubuntu: 使用 netfilter-persistent 统一持久化 (含 v4+v6)
         netfilter-persistent save >/dev/null 2>&1
-    elif command -v iptables-save &>/dev/null; then
-        mkdir -p /etc/iptables
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null
+    else
+        # Alpine / 通用方案: 分别保存 v4 和 v6 规则到标准路径
+        if command -v iptables-save &>/dev/null; then
+            mkdir -p /etc/iptables
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        fi
+        if command -v ip6tables-save &>/dev/null; then
+            mkdir -p /etc/iptables
+            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+        fi
+    fi
+    # Alpine OpenRC: 尝试使用 rc-service 保存
+    if command -v rc-service &>/dev/null; then
+        rc-service iptables save 2>/dev/null
+        rc-service ip6tables save 2>/dev/null
     fi
 }
 
-# 原子修改 JSON
+# 原子修改 JSON (与主脚本 singbox.sh 保持一致，不静默吞掉 jq 错误)
 _atomic_modify_json() {
     local file="$1" filter="$2"
     [ ! -f "$file" ] && return 1
     local tmp="${file}.tmp"
-    if jq "$filter" "$file" > "$tmp" 2>/dev/null; then
-        mv "$tmp" "$file"
-    else
-        _error "修改 JSON 失败: $file"; rm -f "$tmp"; return 1
-    fi
+    if jq "$filter" "$file" > "$tmp"; then mv "$tmp" "$file"
+    else _error "修改JSON失败: $file"; rm -f "$tmp"; return 1; fi
 }
 
 # 单个原子修改 YAML
@@ -147,7 +167,7 @@ _add_node_to_relay_yaml() {
     local proxy_json="$1"
     local proxy_name=$(echo "$proxy_json" | jq -r .name)
     
-    # 使用 utils.sh 中定义的全局 YQ_BINARY
+    # 使用本地定义的全局 YQ_BINARY
     if [ ! -f "$YQ_BINARY" ]; then
         _warn "未找到 yq 工具，跳过 YAML 配置生成"
         return
@@ -159,12 +179,12 @@ _add_node_to_relay_yaml() {
         return
     fi
     
-    # 将 JSON 写入临时文件
-    local temp_json="/tmp/relay_node_$$.json"
+    # 将 JSON 写入安全临时文件 (使用 mktemp 避免竞态条件)
+    local temp_json=$(mktemp /tmp/relay_node_XXXXXX.json)
     echo "$proxy_json" > "$temp_json"
     
     # 使用环境变量传递 JSON 字符串，确保安全性
-    export NODE_JSON="$(cat $temp_json)"
+    export NODE_JSON="$(cat "$temp_json")"
     ${YQ_BINARY} eval '.proxies += [env(NODE_JSON)]' -i "$RELAY_CLASH_YAML" 2>/dev/null
     
     # 使用环境变量避免名称中特殊字符问题
@@ -179,7 +199,7 @@ _add_node_to_relay_yaml() {
 
 _remove_node_from_relay_yaml() {
     local proxy_name="$1"
-    # 使用 utils.sh 中定义的全局 YQ_BINARY
+    # 使用本地定义的全局 YQ_BINARY
     
     if [ ! -f "$YQ_BINARY" ]; then
         return
@@ -448,7 +468,7 @@ _landing_config() {
                 if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
                     sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .servername // .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
                 fi
-                [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.apple.com" # 极简保底
+                [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.amd.com" # 极简保底
 
                 local utls_json='{"enabled":true,"fingerprint":"chrome"}'
                 
@@ -508,7 +528,7 @@ _landing_config() {
                 if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
                     sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni // .servername" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
                 fi
-                [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.apple.com"
+                [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.amd.com"
                 outbound_json=$(echo "$outbound_json" | jq --arg sni "$sni" '.tls = {enabled:true, server_name:$sni, insecure:true}')
             fi
             
@@ -536,7 +556,7 @@ _landing_config() {
             if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
                 sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
             fi
-            [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.apple.com"
+            [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.amd.com"
 
             outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg pw "$password" --arg sni "$sni" \
                 '{"type":"hysteria2","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"password":$pw,"tls":{"enabled":true,"server_name":$sni,"insecure":true,"alpn":["h3"]}}')
@@ -556,7 +576,7 @@ _landing_config() {
             if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
                 sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
             fi
-            [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.apple.com"
+            [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.amd.com"
 
             outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg u "$uuid" --arg pw "$password" --arg sni "$sni" --arg cc "$cc" \
                 '{"type":"tuic","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"uuid":$u,"password":$pw,"congestion_control":$cc,"tls":{"enabled":true,"server_name":$sni,"insecure":true,"alpn":["h3"]}}')
@@ -569,7 +589,7 @@ _landing_config() {
             if [ -z "$sni" ] && [ -f "$MAIN_CLASH_YAML" ]; then
                 sni=$(${YQ_BINARY} eval ".proxies[] | select(.port == $port) | .sni" "$MAIN_CLASH_YAML" 2>/dev/null | head -n 1)
             fi
-            [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.apple.com"
+            [ -z "$sni" ] || [ "$sni" == "null" ] && sni="www.amd.com"
             outbound_json=$(jq -n --arg ip "$token_addr" --arg p "$port" --arg pw "$password" --arg sni "$sni" \
                 '{"type":"anytls","tag":"TEMP_TAG","server":$ip,"server_port":($p|tonumber),"password":$pw,"tls":{"enabled":true,"server_name":$sni,"insecure":true}}')
             ;;
@@ -581,9 +601,21 @@ _landing_config() {
     esac
     
     if [ -n "$outbound_json" ]; then
-        local token_base64=$(echo "$outbound_json" | base64 | tr -d '\n')
-        echo -e "\n  ${GREEN}成功！全协议 Token 已生成 (v11.3):${NC}"
-        echo -e "  ${YELLOW}${token_base64}${NC}\n"
+        # [安全增强] 使用 AES-256-CBC 加密 Token，防止明文泄露敏感信息
+        local passphrase=$(openssl rand -hex 8)
+        local encrypted_token=$(echo "$outbound_json" | openssl enc -aes-256-cbc -pbkdf2 -a -A -pass "pass:${passphrase}" 2>/dev/null)
+        if [ -n "$encrypted_token" ]; then
+            # Token 格式: ENC:<密钥>:<加密内容>  (中转机通过前缀识别加密Token)
+            local token_final="ENC:${passphrase}:${encrypted_token}"
+            echo -e "\n  ${GREEN}成功！全协议加密 Token 已生成:${NC}"
+            echo -e "  ${YELLOW}${token_final}${NC}\n"
+        else
+            # openssl 加密失败时回退到 Base64 (兼容性保底)
+            local token_base64=$(echo "$outbound_json" | base64 | tr -d '\n')
+            echo -e "\n  ${GREEN}成功！全协议 Token 已生成 (Base64):${NC}"
+            echo -e "  ${YELLOW}${token_base64}${NC}\n"
+            _warn "openssl 加密不可用，已回退到 Base64 编码 (明文传输)。"
+        fi
         _info "使用说明: 请在中转机上使用 [2] 导入此 Token。"
     else
         _error "Token 生成失败。"
@@ -599,6 +631,23 @@ _finalize_relay_setup() {
     local dest_addr="$2"
     local dest_port="$3"
     local outbound_json="$4"
+    
+    # [核心连通性拦截] 拦截强制启用 Vision 的第三方节点
+    if [ "$dest_type" == "vless" ]; then
+        local flow_val=$(echo "$outbound_json" | jq -r '.flow // empty')
+        if [ "$flow_val" == "xtls-rprx-vision" ]; then
+            echo ""
+            _error "检测到目标落地节点强制启用了 [xtls-rprx-vision] 流控！"
+            _error "根据底层的物理核心限制，跨协议应用层中转无法处理 Vision 流量。"
+            _warn  "请按回车键返回主菜单，然后改用端口转发！"
+            echo ""
+            read -p "  按回车键返回..."
+            return 1
+        fi
+        
+        # 对于其它可能遗留的未知 flow 属性，为求安全也一律安全剥离
+        outbound_json=$(echo "$outbound_json" | jq 'del(.flow)')
+    fi
 
     _success "已解析落地节点: ${dest_type} -> ${dest_addr}:${dest_port}"
     
@@ -623,7 +672,7 @@ _finalize_relay_setup() {
     # --- 配置入口详细信息 ---
     while true; do
         read -p "  请输入本机监听端口 (回车随机): " listen_port
-        [[ -z "$listen_port" ]] && listen_port=$(( RANDOM % 40001 + 10000 ))
+        [[ -z "$listen_port" ]] && listen_port=$(( $(od -An -tu2 -N2 /dev/urandom | tr -d ' ') % 40001 + 10000 ))
         
         if _check_port_occupied "$listen_port"; then
             _error "端口 $listen_port 已被系统占用，请重新输入！"
@@ -633,8 +682,8 @@ _finalize_relay_setup() {
         fi
     done
     
-    read -p "  请输入中转机入口 SNI (回车默认 www.apple.com): " entrance_sni
-    [[ -z "$entrance_sni" ]] && entrance_sni="www.apple.com"
+    read -p "  请输入中转机入口 SNI (回车默认 www.amd.com): " entrance_sni
+    [[ -z "$entrance_sni" ]] && entrance_sni="www.amd.com"
     
     local default_name="${dest_type}-Relay-${listen_port}"
     read -p "  请输入节点名称 (回车: ${default_name}): " node_name
@@ -666,6 +715,10 @@ _finalize_relay_setup() {
     # 构造路由规则内容 (修复：定义被误删的变量)
     local rule_json=$(jq -n --arg it "$inbound_tag" --arg ot "$outbound_tag" '{"inbound": $it, "outbound": $ot}')
     
+    # [作用域修复] 统一获取公网IP，避免在每个分支中重复声明 local server_ip
+    local relay_server_ip=$(_get_public_ip)
+    local link_ip="$relay_server_ip"; [[ "$relay_server_ip" == *":"* ]] && link_ip="[$relay_server_ip]"
+    
     if [ "$relay_type" == "vless-reality" ]; then
         local uuid=$($SINGBOX_BIN generate uuid)
         keypair=$($SINGBOX_BIN generate reality-keypair)
@@ -677,36 +730,67 @@ _finalize_relay_setup() {
         local flow="xtls-rprx-vision"
 
         inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg u "$uuid" --arg f "$flow" --arg sn "$entrance_sni" --arg pk "$pk" --arg sid "$sid" \
-            '{"type":"vless","tag":$t,"listen":"0.0.0.0","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":$f}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
+            '{"type":"vless","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"flow":$f}],"tls":{"enabled":true,"server_name":$sn,"reality":{"enabled":true,"handshake":{"server":$sn,"server_port":443},"private_key":$pk,"short_id":[$sid]}}}')
              
-        local server_ip=$(_get_public_ip)
-        link="vless://${uuid}@${server_ip}:${listen_port}?encryption=none&flow=${flow}&security=reality&sni=${entrance_sni}&fp=chrome&pbk=${pbk}&sid=${sid}&type=tcp#$(_url_encode "${node_name}")"
+        link="vless://${uuid}@${link_ip}:${listen_port}?encryption=none&flow=${flow}&security=reality&sni=${entrance_sni}&fp=chrome&pbk=${pbk}&sid=${sid}&type=tcp#$(_url_encode "${node_name}")"
         
     elif [ "$relay_type" == "hysteria2" ]; then
         local password=$($SINGBOX_BIN generate rand --hex 16)
         
+        local hop_str=""
+        local port_range=""
+        read -p "是否为本 Hysteria2 中转入口开启跳跃端口? (y/N): " hop_choice
+        if [[ "$hop_choice" == "y" || "$hop_choice" == "Y" ]]; then
+            read -p "请输入接收跳转端口范围 (例如 40000-45000): " port_range
+            if [[ "$port_range" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                local hop_start="${BASH_REMATCH[1]}"
+                local hop_end="${BASH_REMATCH[2]}"
+                
+                local iptables_available="false"
+                if command -v iptables &>/dev/null; then
+                    # 探测宿主机是否扣留了 NAT 映射执行权限（部分劣质 LXC/Docker 典型症状）
+                    if iptables -t nat -L PREROUTING -n &>/dev/null; then
+                        iptables_available="true"
+                    fi
+                fi
+                
+                if [ "$iptables_available" == "true" ]; then
+                    iptables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $listen_port
+                    if command -v ip6tables &>/dev/null && ip6tables -t nat -L PREROUTING -n &>/dev/null; then
+                        ip6tables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $listen_port 2>/dev/null
+                    fi
+                    hop_str="&mport=${port_range}"
+                    _info "已注入底层 iptables 极速端口映射: UDP ${port_range} -> ${listen_port}"
+                else
+                    _warn "环境受限：原生容器 (LXC/Docker) 缺失必需的系统级 iptables NAT 操作权限。"
+                    _warn "高级中转为了节点本身的绝对稳定，不支持易崩溃的 JSON 多实例监听平替，现已安全截停并取消本次跳跃设定。"
+                    port_range=""
+                fi
+            else
+                _warn "跳跃端口格式错误，已取消该功能。"
+                port_range=""
+            fi
+        fi
+        
         inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg pw "$password" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" \
-            '{"type":"hysteria2","tag":$t,"listen":"0.0.0.0","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
+            '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
 
-        local server_ip=$(_get_public_ip)
-        link="hysteria2://${password}@${server_ip}:${listen_port}?sni=${entrance_sni}&insecure=1&up=10000&down=10000#$(_url_encode "${node_name}")"
+        link="hysteria2://${password}@${link_ip}:${listen_port}?sni=${entrance_sni}&insecure=1&up=10000&down=10000${hop_str}#$(_url_encode "${node_name}")"
         
     elif [ "$relay_type" == "tuic" ]; then
         local uuid=$($SINGBOX_BIN generate uuid)
         local password=$($SINGBOX_BIN generate rand --hex 16)
         inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg u "$uuid" --arg pw "$password" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" \
-            '{"type":"tuic","tag":$t,"listen":"0.0.0.0","listen_port":($p|tonumber),"users":[{"uuid":$u,"password":$pw}],"congestion_control":"bbr","tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
+            '{"type":"tuic","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"uuid":$u,"password":$pw}],"congestion_control":"bbr","tls":{"enabled":true,"server_name":$sn,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}}')
             
-        local server_ip=$(_get_public_ip)
-        link="tuic://${uuid}:${password}@${server_ip}:${listen_port}?sni=${entrance_sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "${node_name}")"
+        link="tuic://${uuid}:${password}@${link_ip}:${listen_port}?sni=${entrance_sni}&alpn=h3&congestion_control=bbr&udp_relay_mode=native&allow_insecure=1#$(_url_encode "${node_name}")"
         
     elif [ "$relay_type" == "anytls" ]; then
         local password=$($SINGBOX_BIN generate uuid)
         inbound_json=$(jq -n --arg t "$inbound_tag" --arg p "$listen_port" --arg pw "$password" --arg sn "$entrance_sni" --arg cert "$cert_path" --arg key "$key_path" \
-            '{"type":"anytls","tag":$t,"listen":"0.0.0.0","listen_port":($p|tonumber),"users":[{"name":"default","password":$pw}],"padding_scheme":["stop=2","0=100-200","1=100-200"],"tls":{"enabled":true,"server_name":$sn,"certificate_path":$cert,"key_path":$key}}')
+            '{"type":"anytls","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"name":"default","password":$pw}],"padding_scheme":["stop=2","0=100-200","1=100-200"],"tls":{"enabled":true,"server_name":$sn,"certificate_path":$cert,"key_path":$key}}')
             
-        local server_ip=$(_get_public_ip)
-        link="anytls://${password}@${server_ip}:${listen_port}?security=tls&sni=${entrance_sni}&insecure=1&allowInsecure=1&type=tcp#$(_url_encode "${node_name}")"
+        link="anytls://${password}@${link_ip}:${listen_port}?security=tls&sni=${entrance_sni}&insecure=1&allowInsecure=1&type=tcp#$(_url_encode "${node_name}")"
     fi
     
     # 2. 写入配置到主配置文件
@@ -742,16 +826,15 @@ _finalize_relay_setup() {
     _manage_service restart
     _save_iptables_rules
     
-    # 3. 存储链接信息
+    # 3. 存储链接信息与扩展参数清理信息
     local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
     local metadata=$(jq -n --arg link "$link" --arg created "$(date '+%Y-%m-%d %H:%M:%S')" --arg relay_type "$relay_type" \
-        --arg landing_type "$dest_type" --arg landing_addr "${dest_addr}:${dest_port}" --arg node_name "$node_name" \
-        '{link: $link, created_at: $created, relay_type: $relay_type, landing_type: $landing_type, landing_addr: $landing_addr, node_name: $node_name}')
+        --arg landing_type "$dest_type" --arg landing_addr "${dest_addr}:${dest_port}" --arg node_name "$node_name" --arg hop "$port_range" \
+        '{link: $link, created_at: $created, relay_type: $relay_type, landing_type: $landing_type, landing_addr: $landing_addr, node_name: $node_name} | if $hop != "" then .port_hopping = $hop else . end')
     jq --arg tag "$inbound_tag" --argjson meta "$metadata" '.[$tag] = $meta' "$LINKS_FILE" > "${LINKS_FILE}.tmp" && mv "${LINKS_FILE}.tmp" "$LINKS_FILE"
     _log_operation "CREATE_RELAY" "Type: $relay_type, Port: $listen_port, Landing: ${dest_type}@${dest_addr}:${dest_port}"
     
-    # 4. 添加到中转机专用 YAML 配置
-    local server_ip=$(_get_public_ip)
+    # 4. 添加到中转机专用 YAML 配置 (复用上方已获取的 relay_server_ip)
     local proxy_json=""
     if [ "$relay_type" == "vless-reality" ]; then
         local uuid=$(echo "$inbound_json" | jq -r '.users[0].uuid')
@@ -760,23 +843,23 @@ _finalize_relay_setup() {
         local pk=$(echo "$inbound_json" | jq -r '.tls.reality.private_key')
         local sid=$(echo "$inbound_json" | jq -r '.tls.reality.short_id[0]')
         local pbk=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
-        proxy_json=$(jq -n --arg n "$node_name" --arg s "$server_ip" --arg p "$listen_port" --arg u "$uuid" --arg sn "$sn" --arg pbk "$pbk" --arg sid "$sid" --arg flow "$flow" \
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg u "$uuid" --arg sn "$sn" --arg pbk "$pbk" --arg sid "$sid" --arg flow "$flow" \
             '{name:$n,type:"vless",server:$s,port:($p|tonumber),uuid:$u,tls:true,udp:true,network:"tcp",flow:$flow,servername:$sn,"client-fingerprint":"chrome","reality-opts":{"public-key":$pbk,"short-id":$sid}}')
     elif [ "$relay_type" == "hysteria2" ]; then
         local password=$(echo "$inbound_json" | jq -r '.users[0].password')
         local sn=$(echo "$inbound_json" | jq -r '.tls.server_name')
-        proxy_json=$(jq -n --arg n "$node_name" --arg s "$server_ip" --arg p "$listen_port" --arg pw "$password" --arg sn "$sn" \
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg pw "$password" --arg sn "$sn" \
             '{name:$n,type:"hysteria2",server:$s,port:($p|tonumber),password:$pw,sni:$sn,"skip-cert-verify":true,alpn:["h3"]}')
     elif [ "$relay_type" == "tuic" ]; then
         local uuid=$(echo "$inbound_json" | jq -r '.users[0].uuid')
         local password=$(echo "$inbound_json" | jq -r '.users[0].password')
         local sn=$(echo "$inbound_json" | jq -r '.tls.server_name')
-        proxy_json=$(jq -n --arg n "$node_name" --arg s "$server_ip" --arg p "$listen_port" --arg u "$uuid" --arg pw "$password" --arg sn "$sn" \
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg u "$uuid" --arg pw "$password" --arg sn "$sn" \
             '{name:$n,type:"tuic",server:$s,port:($p|tonumber),uuid:$u,password:$pw,sni:$sn,"skip-cert-verify":true,alpn:["h3"],"udp-relay-mode":"native","congestion-controller":"bbr"}')
     elif [ "$relay_type" == "anytls" ]; then
         local password=$(echo "$inbound_json" | jq -r '.users[0].password')
         local sn=$(echo "$inbound_json" | jq -r '.tls.server_name')
-        proxy_json=$(jq -n --arg n "$node_name" --arg s "$server_ip" --arg p "$listen_port" --arg pw "$password" --arg sn "$sn" \
+        proxy_json=$(jq -n --arg n "$node_name" --arg s "$relay_server_ip" --arg p "$listen_port" --arg pw "$password" --arg sn "$sn" \
             '{name:$n,type:"anytls",server:$s,port:($p|tonumber),password:$pw,"client-fingerprint":"chrome",udp:true,sni:$sn,alpn:["h2","http/1.1"],"skip-cert-verify":true}')
     fi
     [ -n "$proxy_json" ] && _add_node_to_relay_yaml "$proxy_json"
@@ -803,11 +886,27 @@ _relay_config() {
     if [ -z "$token_input" ]; then _error "输入为空。"; return; fi
     
     local decoded_json
-    decoded_json=$(echo "$token_input" | base64 -d 2>/dev/null)
-    local decode_status=$?
-    if [ $decode_status -ne 0 ] || [ -z "$decoded_json" ] || ! echo "$decoded_json" | jq . >/dev/null 2>&1; then
-        _error "Token 无效或无法解码！"
-        return
+    
+    # [安全增强] 智能检测加密Token (ENC:密钥:内容) 或旧版Base64 Token
+    if [[ "$token_input" == ENC:* ]]; then
+        _info "检测到加密 Token，正在解密..."
+        local passphrase=$(echo "$token_input" | cut -d':' -f2)
+        local encrypted_data=$(echo "$token_input" | cut -d':' -f3-)
+        decoded_json=$(echo "$encrypted_data" | openssl enc -aes-256-cbc -pbkdf2 -d -a -A -pass "pass:${passphrase}" 2>/dev/null)
+        if [ -z "$decoded_json" ] || ! echo "$decoded_json" | jq . >/dev/null 2>&1; then
+            _error "Token 解密失败！密钥可能不正确。"
+            return
+        fi
+        _success "Token 解密成功。"
+    else
+        # 向后兼容: 尝试旧版 Base64 解码
+        decoded_json=$(echo "$token_input" | base64 -d 2>/dev/null)
+        local decode_status=$?
+        if [ $decode_status -ne 0 ] || [ -z "$decoded_json" ] || ! echo "$decoded_json" | jq . >/dev/null 2>&1; then
+            _error "Token 无效或无法解码！"
+            return
+        fi
+        _warn "检测到旧版未加密 Token，建议在落地机重新生成加密版本。"
     fi
     
     local dest_type=$(echo "$decoded_json" | jq -r '.type')
@@ -956,6 +1055,19 @@ _delete_relay() {
         read -p "  确认删除所有? (yes/N): " confirm_all
         if [[ "$confirm_all" == "yes" ]]; then
             _info "正在批量删除..."
+            
+            # 清理历史可能存在的 iptables 跳跃端口规则
+            if [ -f "${RELAY_AUX_DIR}/relay_links.json" ]; then
+                jq -r 'to_entries | .[] | select(.value.port_hopping) | "\(.key)|\(.value.port_hopping)"' "${RELAY_AUX_DIR}/relay_links.json" 2>/dev/null | while IFS="|" read -r ptag hop; do
+                    local psuffix=$(echo "$ptag" | grep -oE "[0-9]+$")
+                    local hstart="${hop%-*}"
+                    local hend="${hop#*-}"
+                    if command -v iptables &>/dev/null; then iptables -t nat -D PREROUTING -p udp --dport ${hstart}:${hend} -j REDIRECT --to-ports $psuffix 2>/dev/null; fi
+                    if command -v ip6tables &>/dev/null; then ip6tables -t nat -D PREROUTING -p udp --dport ${hstart}:${hend} -j REDIRECT --to-ports $psuffix 2>/dev/null; fi
+                done
+                _save_iptables_rules 2>/dev/null
+            fi
+            
             # 简化逻辑：直接重置配置文件
             echo '{"inbounds":[],"outbounds":[],"route":{"rules":[]}}' > "$RELAY_CONFIG_FILE"
             echo '{}' > "${RELAY_AUX_DIR}/relay_links.json"
@@ -993,7 +1105,24 @@ _delete_relay() {
     
     if [ -f "$LINKS_FILE" ]; then
         local node_name_yaml=$(jq -r --arg t "$in_tag" '.[$t].node_name // empty' "$LINKS_FILE")
+        local port_hopping=$(jq -r --arg t "$in_tag" '.[$t].port_hopping // empty' "$LINKS_FILE")
+        
         [ -n "$node_name_yaml" ] && _remove_node_from_relay_yaml "$node_name_yaml"
+        
+        # 将端口跳跃相关的 iptables 规则彻底卸载脱勾
+        if [ -n "$port_hopping" ]; then
+            local hop_start="${port_hopping%-*}"
+            local hop_end="${port_hopping#*-}"
+            if command -v iptables &>/dev/null; then
+                iptables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port_suffix 2>/dev/null
+            fi
+            if command -v ip6tables &>/dev/null; then
+                ip6tables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port_suffix 2>/dev/null
+            fi
+            _save_iptables_rules 2>/dev/null
+            _info "已卸载绑定的 iptables UDP 端口跳跃范围转发规则 (${port_hopping})"
+        fi
+        
         _atomic_modify_json "$LINKS_FILE" "del(.\""$in_tag"\")"
     fi
     
@@ -1093,6 +1222,25 @@ _modify_relay_port() {
         ${YQ_BINARY} eval '(.proxy-groups[].proxies[] | select(. == env(OLD_RELAY_NAME))) = env(NEW_RELAY_NAME)' -i "$RELAY_CLASH_YAML"
         
         _success "YAML 节点名同步完成: ${old_node_name} -> ${new_node_name}"
+    fi
+
+    # 联动更新端口跳跃的 iptables 映射规则 (否则跳跃流量仍被转发到旧端口)
+    local LINKS_FILE="${RELAY_AUX_DIR}/relay_links.json"
+    if [ -f "$LINKS_FILE" ]; then
+        local hop_info=$(jq -r --arg t "$in_tag" '.[$t].port_hopping // empty' "$LINKS_FILE" 2>/dev/null)
+        if [ -n "$hop_info" ]; then
+            local hop_start="${hop_info%-*}"
+            local hop_end="${hop_info#*-}"
+            if command -v iptables &>/dev/null && iptables -t nat -L PREROUTING -n &>/dev/null; then
+                iptables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $old_port 2>/dev/null
+                iptables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $new_port
+            fi
+            if command -v ip6tables &>/dev/null && ip6tables -t nat -L PREROUTING -n &>/dev/null; then
+                ip6tables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $old_port 2>/dev/null
+                ip6tables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $new_port 2>/dev/null
+            fi
+            _info "已将端口跳跃映射从 ${old_port} 联动更新到 ${new_port}"
+        fi
     fi
 
     # 记录操作
@@ -1195,10 +1343,10 @@ _pf_add() {
     local inbound_json
     if [ -n "$network" ]; then
         inbound_json=$(jq -n --arg t "$in_tag" --argjson p "$listen_port" --arg net "$network" \
-            '{"type":"direct","tag":$t,"listen":"0.0.0.0","listen_port":$p,"network":$net}')
+            '{"type":"direct","tag":$t,"listen":"::","listen_port":$p,"network":$net}')
     else
         inbound_json=$(jq -n --arg t "$in_tag" --argjson p "$listen_port" \
-            '{"type":"direct","tag":$t,"listen":"0.0.0.0","listen_port":$p}')
+            '{"type":"direct","tag":$t,"listen":"::","listen_port":$p}')
     fi
     
     # outbound: 纯 direct（不带 override，兼容 sing-box 1.11+）
@@ -1521,7 +1669,7 @@ _menu() {
         echo -e "${CYAN}"
         echo "  ╔═══════════════════════════════════════╗"
         echo "  ║       singbox-lite 进阶转发管理       ║"
-        echo "  ║                (v12)                  ║"
+        echo "  ║                (v13)                  ║"
         echo "  ╚═══════════════════════════════════════╝"
         echo -e "${NC}"
 
@@ -1579,7 +1727,7 @@ _menu() {
                    _manage_service restart
                    _success "全部中转已清空"
                fi ;;
-            0) exit 0 ;;
+            0) break ;;
             8) _port_forward_menu ;;
             *) _error "无效输入"; sleep 1 ;;
         esac

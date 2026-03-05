@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # 基础路径定义
-export SCRIPT_VERSION="12"
-export DEFAULT_SNI="www.apple.com"
+export SCRIPT_VERSION="13"
+export DEFAULT_SNI="www.amd.com"
 SELF_SCRIPT_PATH="$(readlink -f "$0")"
 SCRIPT_DIR="$(dirname "$SELF_SCRIPT_PATH")"
 SINGBOX_DIR="/usr/local/etc/sing-box"
@@ -117,6 +117,29 @@ _check_port_conflict() {
     return 1
 }
 
+# IPTables 规则持久化 (跨 Debian/Alpine 双发行版兼容)
+_save_iptables_rules() {
+    if command -v netfilter-persistent &>/dev/null; then
+        # Debian/Ubuntu: 使用 netfilter-persistent 统一持久化 (含 v4+v6)
+        netfilter-persistent save >/dev/null 2>&1
+    else
+        # Alpine / 通用方案: 分别保存 v4 和 v6 规则到标准路径
+        if command -v iptables-save &>/dev/null; then
+            mkdir -p /etc/iptables
+            iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        fi
+        if command -v ip6tables-save &>/dev/null; then
+            mkdir -p /etc/iptables
+            ip6tables-save > /etc/iptables/rules.v6 2>/dev/null
+        fi
+    fi
+    # Alpine OpenRC: 尝试使用 rc-service 保存
+    if command -v rc-service &>/dev/null; then
+        rc-service iptables save 2>/dev/null
+        rc-service ip6tables save 2>/dev/null
+    fi
+}
+
 # 公网 IP 初始化
 _init_server_ip() {
     _info "正在获取服务器公网 IP..."
@@ -132,6 +155,16 @@ _init_server_ip() {
 # 统一服务管理
 _manage_service() {
     local action="$1"
+
+    # [关键核心修复] 动态注入内置 NTP 时间同步模块
+    # 解决部分廉价 LXC/Docker 容器无法修改母机系统时间，导致 SS-2022 触发 30s 重放保护直接爆 bad timestamp 拒连的断流问题
+    if [[ "$action" == "restart" || "$action" == "start" ]]; then
+        if [ -s "$CONFIG_FILE" ] && ! jq -e '.ntp' "$CONFIG_FILE" >/dev/null 2>&1; then
+            _info "检测到内核配置缺失内置时间同步(NTP)模块，正在自动注入防重放保护补丁..."
+            _atomic_modify_json "$CONFIG_FILE" '.ntp = {"enabled": true, "server": "time.apple.com", "server_port": 123, "interval": "30m"}' 2>/dev/null
+        fi
+    fi
+
     [ -z "$INIT_SYSTEM" ] && _detect_init_system
     [ "$action" == "status" ] || _info "正在使用 ${INIT_SYSTEM} 执行: $action..."
     case "$INIT_SYSTEM" in
@@ -329,11 +362,40 @@ _install_sing_box() {
     
     local api_url="https://api.github.com/repos/SagerNet/sing-box/releases/latest"
     local search_pattern="linux-${arch_tag}${libc_suffix}.tar.gz"
-    local download_url=$(curl -s "$api_url" | jq -r ".assets[] | select(.name | contains(\"${search_pattern}\")) | .browser_download_url")
+    local release_info=$(curl -s "$api_url")
+    local download_url=$(echo "$release_info" | jq -r ".assets[] | select(.name | contains(\"${search_pattern}\")) | .browser_download_url" | head -1)
+    local checksum_url=$(echo "$release_info" | jq -r '.assets[] | select(.name | endswith("checksums.txt")) | .browser_download_url' | head -1)
     
     if [ -z "$download_url" ]; then _error "无法获取 sing-box 下载链接 (搜索: ${search_pattern})。"; exit 1; fi
     
     wget -qO sing-box.tar.gz "$download_url" || { _error "下载失败!"; exit 1; }
+    
+    # SHA256 完整性校验
+    if [ -n "$checksum_url" ]; then
+        _info "正在进行 SHA256 完整性校验..."
+        local checksums=$(wget -qO- "$checksum_url" 2>/dev/null)
+        if [ -n "$checksums" ]; then
+            local dl_filename=$(basename "$download_url")
+            local expected_hash=$(echo "$checksums" | grep "$dl_filename" | awk '{print $1}')
+            if [ -n "$expected_hash" ]; then
+                local actual_hash=$(sha256sum sing-box.tar.gz | awk '{print $1}')
+                if [ "$expected_hash" != "$actual_hash" ]; then
+                    _error "SHA256 校验失败！文件可能已被篡改。"
+                    _error "预期: ${expected_hash}"
+                    _error "实际: ${actual_hash}"
+                    rm -f sing-box.tar.gz
+                    exit 1
+                fi
+                _success "SHA256 校验通过。"
+            else
+                _warn "校验文件中未找到匹配条目，跳过校验。"
+            fi
+        else
+            _warn "校验文件下载失败，跳过校验。"
+        fi
+    else
+        _warn "未找到 SHA256 校验文件，跳过完整性校验。"
+    fi
     
     local temp_dir=$(mktemp -d)
     tar -xzf sing-box.tar.gz -C "$temp_dir"
@@ -548,7 +610,7 @@ _add_argo_node() {
         else
             [ -n "$port" ] && _warning "端口格式无效，将重新生成..."
             # 使用内建算法生成随机端口 (10000-60000)，移除 shuf 依赖
-            port=$(( 10000 + RANDOM % 50001 ))
+            port=$(( $(od -An -tu2 -N2 /dev/urandom | tr -d ' ') % 50001 + 10000 ))
             _info "正在尝试分配随机内部端口: ${port}..."
         fi
     done
@@ -1414,7 +1476,7 @@ _create_service_files() {
 }
 
 
-# 此处已由 utils.sh 中的 _manage_service 替代，移除本地定义以防冲突
+# 注意: _manage_service 已在上方定义，此处不再重复定义
 
 _view_log() {
     if [ "$INIT_SYSTEM" == "systemd" ]; then
@@ -1521,6 +1583,12 @@ _initialize_config_files() {
         # 初始化包含完整 dns 配置和路由策略的基础文件，以支持中转第三方域名节点，防污染并规避 IPv6 握手黑洞问题
         cat > "$CONFIG_FILE" << 'EOF'
 {
+  "ntp": {
+    "enabled": true,
+    "server": "time.apple.com",
+    "server_port": 123,
+    "interval": "30m"
+  },
   "dns": {
     "servers": [
       {
@@ -1661,7 +1729,7 @@ _cleanup_legacy_config() {
     local needs_restart=false
     
     if jq -e '.outbounds[] | select(.tag | startswith("relay-out-"))' "$CONFIG_FILE" >/dev/null 2>&1; then
-        _warn "检测到舊版中转残留配置，正在清理..."
+        _warn "检测到旧版中转残留配置，正在清理..."
         cp "$CONFIG_FILE" "${CONFIG_FILE}.bak_legacy"
         
         # 删除所有 relay-out- 开头的 outbounds
@@ -1789,7 +1857,7 @@ EOF
 }
 
 # 注意: _atomic_modify_json, _atomic_modify_yaml, _get_proxy_field, _add_node_to_yaml, _remove_node_from_yaml
-# 均由 utils.sh 统一提供，此处不再重复定义以避免不一致
+# 均在上方统一定义，此处不再重复定义以避免不一致
 
 # 显示节点分享链接（在添加节点后调用）
 # 参数: $1=协议类型, $2=节点名称, $3=服务器IP(用于链接), $4=端口, $5=节点TAG, 其他参数根据协议不同
@@ -1925,6 +1993,7 @@ _add_vless_ws_tls() {
     local client_server_addr="${server_ip}"
 
     if [ "$BATCH_MODE" = "true" ]; then
+        [[ -n "$BATCH_IP" ]] && client_server_addr="$BATCH_IP"
         port="$BATCH_PORT"
         camouflage_domain="${BATCH_WS_TLS_DOMAIN:-$BATCH_SNI}"
     else
@@ -2106,6 +2175,7 @@ _add_trojan_ws_tls() {
     local client_server_addr="${server_ip}"
 
     if [ "$BATCH_MODE" = "true" ]; then
+        [[ -n "$BATCH_IP" ]] && client_server_addr="$BATCH_IP"
         port="$BATCH_PORT"
         camouflage_domain="${BATCH_WS_TLS_DOMAIN:-$BATCH_SNI}"
     else
@@ -2292,12 +2362,13 @@ _add_trojan_ws_tls() {
 
 _add_anytls() {
     local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
-    local server_name="www.apple.com"
+    local server_name="www.amd.com"
 
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
-        server_name="${BATCH_SNI:-www.apple.com}"
+        server_name="${BATCH_SNI:-www.amd.com}"
     else
         _info "--- 添加 AnyTLS 节点 ---"
         read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
@@ -2308,8 +2379,8 @@ _add_anytls() {
             _check_port_conflict "$port" "tcp" && continue
             break
         done
-        read -p "请输入伪装域名/SNI (默认: www.apple.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.apple.com"}
+        read -p "请输入伪装域名/SNI (默认: www.amd.com): " camouflage_domain
+        server_name=${camouflage_domain:-"www.amd.com"}
     fi
     
     # --- 步骤 4: 证书选择 ---
@@ -2453,7 +2524,8 @@ _add_anytls() {
 _add_vless_reality() {
     [ -z "$server_ip" ] && server_ip=$(_get_ip)
     local node_ip="${server_ip}"
-    local server_name="www.apple.com"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
+    local server_name="www.amd.com"
     local port=""
     local name=""
 
@@ -2468,8 +2540,8 @@ _add_vless_reality() {
     else
         read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
-        read -p "请输入伪装域名 (默认: www.apple.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.apple.com"}
+        read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
+        server_name=${camouflage_domain:-"www.amd.com"}
         while true; do
             read -p "请输入监听端口: " port
             [[ -z "$port" ]] && _error "端口不能为空" && continue
@@ -2505,6 +2577,7 @@ _add_vless_reality() {
 
 _add_vless_tcp() {
     local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
@@ -2552,8 +2625,9 @@ _add_vless_tcp() {
 _add_hysteria2() {
     [ -z "$server_ip" ] && server_ip=$(_get_ip)
     local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
-    local server_name="www.apple.com"
+    local server_name="www.amd.com"
     local obfs_password=""
     local port_hopping=""
     local use_multiport="false"
@@ -2572,8 +2646,7 @@ _add_hysteria2() {
         if [ -n "$port_hopping" ]; then
             local port_range_start=$(echo $port_hopping | cut -d'-' -f1)
             local port_range_end=$(echo $port_hopping | cut -d'-' -f2)
-            local hop_count=$((port_range_end - port_range_start + 1))
-            [ "$hop_count" -le 1000 ] && use_multiport="true"
+            use_multiport="true"
         fi
     else
         read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
@@ -2584,8 +2657,8 @@ _add_hysteria2() {
             _check_port_conflict "$port" "udp" && continue
             break
         done
-        read -p "请输入伪装域名 (默认: www.apple.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.apple.com"}
+        read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
+        server_name=${camouflage_domain:-"www.amd.com"}
     fi
 
     local tag="hy2-in-${port}"
@@ -2609,8 +2682,7 @@ _add_hysteria2() {
                 port_range_start="${BASH_REMATCH[1]}"
                 port_range_end="${BASH_REMATCH[2]}"
                 port_hopping="$port_range"
-                local hop_count=$((port_range_end - port_range_start + 1))
-                [ "$hop_count" -le 1000 ] && use_multiport="true"
+                use_multiport="true"
             fi
         fi
     fi
@@ -2635,42 +2707,46 @@ _add_hysteria2() {
         '{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}} | if $op != "" then .obfs={"type":"salamander","password":$op} else . end')
     _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$inbound_json] | .inbounds |= unique_by(.tag)" || return 1
 
-    # [!] 新增：多端口监听模式逻辑 (修复 JSON 数组构建)
+    # [!] 重构多端口监听模式逻辑：优先使用 iptables，失败则降级到 JSON Inbound (带数量保护)
     if [ "$use_multiport" == "true" ] && [ -n "$port_hopping" ]; then
-        _info "正在生成多端口监听配置 (${port_range_start}-${port_range_end})..."
-        
-        # 预先构建一个空数组
-        _atomic_modify_json "$CONFIG_FILE" ".inbounds += []"
-
-        for ((p=port_range_start; p<=port_range_end; p++)); do
-            # 跳过主端口和已被占用的端口
-            if [ "$p" -eq "$port" ]; then continue; fi
-            if _check_port_conflict "$p" "udp" "true"; then
-                _warn "辅助端口 ${p} 已被占用，跳过..."
-                continue
+        local iptables_available="false"
+        if command -v iptables &>/dev/null; then
+            # 测试实际能否读写 nat 表 (避免在受限 LXC/Docker 中遭遇 Permission denied)
+            if iptables -t nat -L PREROUTING -n &>/dev/null; then
+                iptables_available="true"
             fi
-            
-            local hop_tag="${tag}-hop-${p}"
-            # 生成单个端口的配置
-            local item_json=$(jq -n --arg t "$hop_tag" --arg p "$p" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" --arg op "$obfs_password" \
-                '{
-                    "type": "hysteria2",
-                    "tag": $t,
-                    "listen": "::",
-                    "listen_port": ($p|tonumber),
-                    "users": [{"password": $pw}],
-                    "tls": {
-                        "enabled": true,
-                        "alpn": ["h3"],
-                        "certificate_path": $cert,
-                        "key_path": $key
-                    }
-                } | if $op != "" then .obfs={"type":"salamander","password":$op} else . end')
-                
-            # 原子追加
-            _atomic_modify_json "$CONFIG_FILE" ".inbounds += [$item_json] | .inbounds |= unique_by(.tag)" || return 1
-        done
-        _success "已添加 $((port_range_end - port_range_start)) 个辅助监听端口"
+        fi
+
+        if [ "$iptables_available" == "true" ]; then
+            iptables -t nat -A PREROUTING -p udp --dport ${port_range_start}:${port_range_end} -j REDIRECT --to-ports $port
+            if command -v ip6tables &>/dev/null && ip6tables -t nat -L PREROUTING -n &>/dev/null; then
+                ip6tables -t nat -A PREROUTING -p udp --dport ${port_range_start}:${port_range_end} -j REDIRECT --to-ports $port 2>/dev/null
+            fi
+            _save_iptables_rules 2>/dev/null
+            _success "已启动底端 iptables 高能效 UDP 端口跳跃范围映射: ${port_hopping} -> ${port}"
+        else
+            _warn "发现防火墙受限 (无 iptables NAT 权限)，准备降级至 Sing-box 原生多实例监听方案..."
+            local hop_count=$((port_range_end - port_range_start + 1))
+            if [ "$hop_count" -le 1000 ]; then
+                _info "正在生成原生大量监听配置块 (${port_range_start}-${port_range_end})..."
+                local batch_array="[]"
+                local skipped=0
+                for ((p=port_range_start; p<=port_range_end; p++)); do
+                    if [ "$p" -eq "$port" ]; then continue; fi
+                    if _check_port_conflict "$p" "udp" "true"; then ((skipped++)); continue; fi
+                    local hop_tag="${tag}-hop-${p}"
+                    batch_array=$(echo "$batch_array" | jq --arg t "$hop_tag" --arg p "$p" --arg pw "$password" --arg cert "$cert_path" --arg key "$key_path" --arg op "$obfs_password" \
+                        '. += [{"type":"hysteria2","tag":$t,"listen":"::","listen_port":($p|tonumber),"users":[{"password":$pw}],"tls":{"enabled":true,"alpn":["h3"],"certificate_path":$cert,"key_path":$key}} | if $op != "" then .obfs={"type":"salamander","password":$op} else . end]')
+                done
+                _atomic_modify_json "$CONFIG_FILE" ".inbounds += $batch_array | .inbounds |= unique_by(.tag)" || return 1
+                local added_count=$(echo "$batch_array" | jq 'length')
+                _success "安全降级成功：已硬编码 ${added_count} 个原生辅助监听节点 (跳过 ${skipped} 个冲突端口)。"
+            else
+                _error "降级失败：目标跳跃端口数量 (${hop_count}) 超出低配原生环境的内存承载安全阈值 (1000)！"
+                _warn "鉴于当前系统容器不支持内核级 iptables 劫持，且端口数量超配，已自动取消该节点的跳跃设定。"
+                port_hopping=""
+            fi
+        fi
     fi
     
     # 保存元数据（包含端口跳跃信息）
@@ -2711,12 +2787,13 @@ _add_hysteria2() {
 
 _add_tuic() {
     local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
-    local server_name="www.apple.com"
+    local server_name="www.amd.com"
 
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
-        server_name="${BATCH_SNI:-www.apple.com}"
+        server_name="${BATCH_SNI:-www.amd.com}"
     else
         read -p "请输入服务器IP地址 (默认: ${server_ip}): " custom_ip
         node_ip=${custom_ip:-$server_ip}
@@ -2726,8 +2803,8 @@ _add_tuic() {
             _check_port_conflict "$port" "udp" && continue
             break
         done
-        read -p "请输入伪装域名 (默认: www.apple.com): " camouflage_domain
-        server_name=${camouflage_domain:-"www.apple.com"}
+        read -p "请输入伪装域名 (默认: www.amd.com): " camouflage_domain
+        server_name=${camouflage_domain:-"www.amd.com"}
     fi
 
     local tag="tuic-in-${port}"
@@ -2771,12 +2848,15 @@ _add_shadowsocks_menu() {
         echo "========================================"
         _info "          添加 Shadowsocks 节点"
         echo "========================================"
-        echo " 1) shadowsocks (aes-256-gcm)"
-        echo " 2) shadowsocks-2022"
-        echo " 3) shadowsocks-2022 + Padding"
+        echo " [经典 SS]"
+        echo " 1) aes-256-gcm"
+        echo " 2) chacha20-ietf-poly1305"
+        echo " [SS-2022 (强抗重放保护)]"
+        echo " 3) 2022-blake3-aes-256-gcm"
+        echo " 4) 2022-blake3-aes-256-gcm (带 Padding)"
         echo " 0) 返回"
         echo "========================================"
-        read -p "请选择加密方式 [0-3]: " choice
+        read -p "请选择加密方式 [0-4]: " choice
     fi
 
     local method="" password="" name_prefix="" use_multiplex=false
@@ -2784,16 +2864,22 @@ _add_shadowsocks_menu() {
         1) 
             method="aes-256-gcm"
             password=$(${SINGBOX_BIN} generate rand --hex 16)
-            name_prefix="SS-aes-256-gcm"
+            name_prefix="SS-aes256"
             ;;
-        2)
-            method="2022-blake3-aes-128-gcm"
-            password=$(${SINGBOX_BIN} generate rand --base64 16)
-            name_prefix="SS-2022"
+        2) 
+            method="chacha20-ietf-poly1305"
+            password=$(${SINGBOX_BIN} generate rand --hex 16)
+            name_prefix="SS-chacha20"
             ;;
         3)
-            method="2022-blake3-aes-128-gcm"
-            password=$(${SINGBOX_BIN} generate rand --base64 16)
+            method="2022-blake3-aes-256-gcm"
+            # SS-2022 的 aes-256 需要严格的 32 字节 (256位) base64 密钥
+            password=$(${SINGBOX_BIN} generate rand --base64 32)
+            name_prefix="SS-2022"
+            ;;
+        4)
+            method="2022-blake3-aes-256-gcm"
+            password=$(${SINGBOX_BIN} generate rand --base64 32)
             name_prefix="SS-2022-Padding"
             use_multiplex=true
             _info "已启用 Multiplex + Padding 模式"
@@ -2804,6 +2890,7 @@ _add_shadowsocks_menu() {
     esac
 
     local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
     if [ "$BATCH_MODE" = "true" ]; then
         port="$BATCH_PORT"
@@ -2897,6 +2984,7 @@ _add_shadowsocks_menu() {
 
 _add_socks() {
     local node_ip="${server_ip}"
+    [[ "$BATCH_MODE" == "true" && -n "$BATCH_IP" ]] && node_ip="$BATCH_IP"
     local port=""
     local username=""
     local password=""
@@ -2958,7 +3046,7 @@ _view_nodes() {
         # 过滤掉多端口监听生成的辅助节点（跳过 tag 中包含 -hop- 的节点）
         if [[ "$tag" == *"-hop-"* ]]; then continue; fi
         
-        # 使用 utils.sh 中的统一查找函数
+        # 使用统一查找函数
         local proxy_name_to_find=$(_find_proxy_name "$port" "$type")
 
         # 创建显示名称，优先使用 clash.yaml 中的名称，失败则回退到 tag
@@ -2986,8 +3074,8 @@ _view_nodes() {
             "vless")
                 # [资源优化] 合并4次jq为1次
                 local _vless_fields
-                # [加固] 智能回溯 SNI: 优先 .tls.server_name, 备选 .tls.reality.handshake.server, 保底 www.apple.com
-                _vless_fields=$(echo "$node" | jq -r '[.users[0].uuid, (.users[0].flow // ""), (.tls.reality.enabled // false | tostring), (.transport.type // ""), (.tls.enabled // false | tostring), (.tls.server_name // .tls.reality.handshake.server // "www.apple.com"), (.transport.path // "")] | @tsv')
+                # [加固] 智能回溯 SNI: 优先 .tls.server_name, 备选 .tls.reality.handshake.server, 保底 www.amd.com
+                _vless_fields=$(echo "$node" | jq -r '[.users[0].uuid, (.users[0].flow // ""), (.tls.reality.enabled // false | tostring), (.transport.type // ""), (.tls.enabled // false | tostring), (.tls.server_name // .tls.reality.handshake.server // "www.amd.com"), (.transport.path // "")] | @tsv')
                 IFS=$'\t' read -r uuid flow is_reality transport_type tls_enabled tls_sn ws_path <<< "$_vless_fields"
                 
                 # [加固] 确保 Reality 模式下的流量控制字段非空 (v2rayN 要求)
@@ -3069,7 +3157,7 @@ _view_nodes() {
                 # [资源优化] 合并2次jq为1次
                 local pw sn
                 # [加固] 允许 server_name 回溯
-                IFS=$'\t' read -r pw sn <<< "$(echo "$node" | jq -r '[.users[0].password, (.tls.server_name // "www.apple.com")] | @tsv')"
+                IFS=$'\t' read -r pw sn <<< "$(echo "$node" | jq -r '[.users[0].password, (.tls.server_name // "www.amd.com")] | @tsv')"
                 local skip_verify=$(_get_proxy_field "$proxy_name_to_find" ".skip-cert-verify")
                 local insecure_param=""
                 if [ "$skip_verify" == "true" ]; then
@@ -3166,6 +3254,18 @@ _delete_node() {
         
         _info "正在删除所有节点..."
         
+        # [安全性加固] 精准分离并销毁仅关联本脚本的 iptables 跳跃端口规则（必须在清空 metadata 之前执行！）
+        if [ -f "$METADATA_FILE" ]; then
+            jq -r 'to_entries | .[] | select(.value.portHopping) | "\(.key)|\(.value.portHopping)"' "$METADATA_FILE" 2>/dev/null | while IFS="|" read -r ptag hop; do
+                local psuffix=$(echo "$ptag" | grep -oE "[0-9]+$")
+                local hstart="${hop%-*}"
+                local hend="${hop#*-}"
+                if command -v iptables &>/dev/null; then iptables -t nat -D PREROUTING -p udp --dport ${hstart}:${hend} -j REDIRECT --to-ports $psuffix 2>/dev/null; fi
+                if command -v ip6tables &>/dev/null; then ip6tables -t nat -D PREROUTING -p udp --dport ${hstart}:${hend} -j REDIRECT --to-ports $psuffix 2>/dev/null; fi
+            done
+            _save_iptables_rules 2>/dev/null
+        fi
+        
         # 清空配置
         _atomic_modify_json "$CONFIG_FILE" '.inbounds = []'
         _atomic_modify_json "$METADATA_FILE" '{}'
@@ -3176,10 +3276,6 @@ _delete_node() {
         
         # 删除所有证书文件
         rm -f ${SINGBOX_DIR}/*.pem ${SINGBOX_DIR}/*.key 2>/dev/null
-        
-        # [安全性加固] 移除暴力清空 iptables 的逻辑
-        # 现在的端口跳跃通过多入站 inbound 实现，不再依赖 iptables 转发
-        # 移除此处逻辑可防止误伤系统中其他程序的 NAT 规则 (如 Docker, KVM 等)
         
         _success "所有节点已删除！"
         _manage_service "restart"
@@ -3197,7 +3293,7 @@ _delete_node() {
     local display_name_to_del=${display_names[$index]}
 
     # --- [!] 新的删除逻辑 ---
-    # 使用 utils.sh 中的统一查找函数确定 clash.yaml 中的确切名称
+    # 使用统一查找函数确定 clash.yaml 中的确切名称
     local proxy_name_to_del=$(_find_proxy_name "$port_to_del" "$type_to_del")
 
     # [!] 已修改：使用显示名称进行确认
@@ -3217,8 +3313,22 @@ _delete_node() {
     # [!] 重要修正：不使用索引删除（因为列表已过滤），改为使用 Tag 精确匹配删除
     _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag == \"$tag_to_del\"))" || return
     
-    # [!] 新增：级联删除关联的辅助端口监听节点 (格式: tag-hop-xxx)
-    _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag | startswith(\"$tag_to_del-hop-\")))"
+    # [!] 新增：精准剥离该节点绑定的系统级防火墙端口跳跃策略
+    local port_hopping=$(echo "$node_metadata" | jq -r '.portHopping // empty' 2>/dev/null)
+    if [ -n "$port_hopping" ]; then
+        local hop_start="${port_hopping%-*}"
+        local hop_end="${port_hopping#*-}"
+        if command -v iptables &>/dev/null; then
+            iptables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port_to_del 2>/dev/null
+        fi
+        if command -v ip6tables &>/dev/null; then
+            ip6tables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $port_to_del 2>/dev/null
+        fi
+        _save_iptables_rules 2>/dev/null
+        _info "已卸载关联的底层 iptables UDP 端口映射策略 (${port_hopping})"
+    fi
+    # [!] 级联清理：同时删除 JSON Fallback 模式可能生成的辅助跳跃子 inbounds (格式: tag-hop-xxx)
+    _atomic_modify_json "$CONFIG_FILE" "del(.inbounds[] | select(.tag | startswith(\"$tag_to_del-hop-\")))" 2>/dev/null
     
     _atomic_modify_json "$METADATA_FILE" "del(.\"$tag_to_del\")" || return
     
@@ -3387,8 +3497,8 @@ _modify_port() {
             # [关键修复] _view_nodes 优先读取的是 .share_link 字段 (非 .link)
             local current_link=$(jq -r ".\"$tag_to_modify\".share_link // \"\"" "$METADATA_FILE")
             if [ -n "$current_link" ]; then
-                # 全局替换：同时修正 URL 端口和备注名中的端口数字
-                local new_link=$(echo "$current_link" | sed "s/${old_port}/${new_port}/g")
+                # 精准替换：仅替换 URL 中端口位置的数字（@IP:PORT? 和 #name-PORT 部分），避免误伤 UUID/密码
+                local new_link=$(echo "$current_link" | sed -E "s/(:${old_port})([?&#\/]|$)/:\${new_port}\2/g; s/(-${old_port})([?&#\/]|$)/-${new_port}\2/g")
                 _atomic_modify_json "$METADATA_FILE" ".\"$tag_to_modify\".share_link = \"$new_link\""
                 _info "分享链接已同步更新。"
             fi
@@ -3423,6 +3533,33 @@ _modify_port() {
         fi
         
         _info "Tag 同步: ${tag_to_modify} -> ${new_tag}"
+    fi
+    
+    # 5. 联动更新端口跳跃的 iptables 映射规则 (critical: 否则跳跃流量仍转发到旧端口)
+    local final_tag="${new_tag:-$tag_to_modify}"
+    local hop_info=$(jq -r --arg t "$final_tag" '.[$t].portHopping // empty' "$METADATA_FILE" 2>/dev/null)
+    if [ -n "$hop_info" ]; then
+        local hop_start="${hop_info%-*}"
+        local hop_end="${hop_info#*-}"
+        # 卸载旧端口上的映射并注入新端口
+        if command -v iptables &>/dev/null && iptables -t nat -L PREROUTING -n &>/dev/null; then
+            iptables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $old_port 2>/dev/null
+            iptables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $new_port
+        fi
+        if command -v ip6tables &>/dev/null && ip6tables -t nat -L PREROUTING -n &>/dev/null; then
+            ip6tables -t nat -D PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $old_port 2>/dev/null
+            ip6tables -t nat -A PREROUTING -p udp --dport ${hop_start}:${hop_end} -j REDIRECT --to-ports $new_port 2>/dev/null
+        fi
+        _save_iptables_rules 2>/dev/null
+        _info "已将端口跳跃映射从 ${old_port} 联动更新到 ${new_port}"
+    fi
+    # 同步更名 JSON Fallback 模式可能遗留的 hop 子 inbounds tag 前缀
+    if [ -n "$new_tag" ] && [ "$new_tag" != "$tag_to_modify" ]; then
+        local hop_inbounds_exist=$(jq -e ".inbounds[] | select(.tag | startswith(\"${tag_to_modify}-hop-\"))" "$CONFIG_FILE" 2>/dev/null)
+        if [ -n "$hop_inbounds_exist" ]; then
+            jq "(.inbounds[] | select(.tag | startswith(\"${tag_to_modify}-hop-\")) | .tag) |= sub(\"${tag_to_modify}\"; \"${new_tag}\")" "$CONFIG_FILE" > "${CONFIG_FILE}.tmp" && mv "${CONFIG_FILE}.tmp" "$CONFIG_FILE"
+            _info "已同步更新辅助跳跃子节点 tag 前缀"
+        fi
     fi
     
     _success "端口修改成功: ${old_port} -> ${new_port}"
@@ -4056,7 +4193,7 @@ _quick_deploy() {
     # 生成3个不重复的随机端口
     local ports=()
     while [ ${#ports[@]} -lt 3 ]; do
-        local p=$(( RANDOM % 50001 + 10000 ))
+        local p=$(( $(od -An -tu2 -N2 /dev/urandom | tr -d ' ') % 50001 + 10000 ))
         # 确保端口不重复
         local duplicate=false
         for existing in "${ports[@]}"; do
@@ -4077,7 +4214,7 @@ _quick_deploy() {
     local port_hy2=${ports[1]}
     local port_tuic=${ports[2]}
     
-    local sni="www.apple.com"
+    local sni="www.amd.com"
     local name_prefix="Quick"
     
     # 用于收集分享链接
@@ -4268,10 +4405,9 @@ _batch_create_nodes() {
     # [修复] 强制初始化服务器 IP，防止各协议函数因变量未定义生成空配置
     [ -z "$server_ip" ] && server_ip=$(_get_ip)
     local batch_ip="${server_ip}"
-    if [ -z "$batch_ip" ]; then
-        read -p "未检测到公网IP，请输入服务器IP: " batch_ip
-        server_ip="$batch_ip"
-    fi
+    read -p "请输入批量节点绑定的IP地址 (回车默认: ${server_ip}): " custom_batch_ip
+    batch_ip=${custom_batch_ip:-$server_ip}
+    export BATCH_IP="$batch_ip"
     
     # 2.1 SNI 收集 (强制净化处理)
     export BATCH_SNI="$DEFAULT_SNI"
@@ -4298,11 +4434,12 @@ _batch_create_nodes() {
     # 2.4 SS 专项 (支持多选)
     local ss_variant="1"
     if [ "$has_ss" = true ]; then
-        echo "选择 Shadowsocks 批量加密方式 (支持多选，如 1,2,3):"
-        echo " 1) aes-256-gcm (默认)"
-        echo " 2) ss-2022"
-        echo " 3) ss-2022-padding"
-        read -p "选择 [1-3]: " ss_choice
+        echo "选择 Shadowsocks 批量加密方式 (支持多选，如 1,2,3,4):"
+        echo " 1) aes-256-gcm"
+        echo " 2) chacha20-ietf-poly1305"
+        echo " 3) 2022-blake3-aes-256-gcm"
+        echo " 4) 2022-blake3-aes-256-gcm (带 Padding)"
+        read -p "选择 [1-4] (默认1): " ss_choice
         ss_variant=${ss_choice:-1}
         # 计算 SS 实际需要的端口数
         local ss_needed=$(echo "$ss_variant" | tr ',' ' ' | wc -w)
@@ -4372,7 +4509,7 @@ _batch_create_nodes() {
         fi
     done
 
-    unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT
+    unset BATCH_MODE BATCH_PORT BATCH_SNI BATCH_HY2_OBFS BATCH_HY2_HOP BATCH_SS_VARIANT BATCH_IP
     
     echo ""
     echo -e "${YELLOW}══════════════════ 批量创建完成提示 ══════════════════${NC}"
